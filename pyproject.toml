@@ -1,0 +1,45 @@
+[project]
+name = "amplifier-module-provider-bedrock"
+version = "1.0.0"
+description = "AWS Bedrock provider module - Claude and other models via AWS Bedrock for Amplifier"
+license = "MIT"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [
+    { name = "Bryce Cutt", email = "brycecutt@microsoft.com" },
+]
+dependencies = [
+    "anthropic[bedrock]>=0.25.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/brycecutt-msft/amplifier-module-provider-bedrock"
+Repository = "https://github.com/brycecutt-msft/amplifier-module-provider-bedrock.git"
+Issues = "https://github.com/brycecutt-msft/amplifier-module-provider-bedrock/issues"
+Documentation = "https://github.com/brycecutt-msft/amplifier-module-provider-bedrock#readme"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "amplifier-core>=0.1.0",
+]
+
+[project.entry-points."amplifier.modules"]
+provider-bedrock = "amplifier_module_provider_bedrock:mount"
+
+[build-system]
+requires = [
+    "hatchling",
+]
+build-backend = "hatchling.build"
+
+[tool.uv]
+package = true
+
+[tool.hatch.build.targets.wheel]
+packages = [
+    "amplifier_module_provider_bedrock",
+]
+
+[tool.hatch.metadata]
+allow-direct-references = true
