@@ -13,8 +13,16 @@ import time
 from typing import Any
 
 from amplifier_core import ModuleCoordinator
-from amplifier_core.content_models import TextContent, ThinkingContent, ToolCallContent
-from amplifier_core.message_models import ChatRequest, ChatResponse, ToolCall, Usage
+from amplifier_core.message_models import (
+    ChatRequest,
+    ChatResponse,
+    Message,
+    TextBlock,
+    ThinkingBlock,
+    ToolCall,
+    ToolCallBlock,
+    Usage,
+)
 from anthropic import AsyncAnthropicBedrock
 
 logger = logging.getLogger(__name__)
@@ -189,250 +197,93 @@ class BedrockProvider:
         return model_id
 
 
-    async def complete(self, messages: list[dict[str, Any]] | ChatRequest, **kwargs) -> ChatResponse:
+    async def complete(self, request: ChatRequest, **kwargs) -> ChatResponse:
         """
-        Generate completion from messages.
+        Generate completion from ChatRequest.
 
         Args:
-            messages: Conversation history (list of dicts or ChatRequest)
-            **kwargs: Additional parameters
+            request: Typed chat request with messages, tools, config
+            **kwargs: Provider-specific options (override request fields)
 
         Returns:
-            Provider response or ChatResponse
+            ChatResponse with content blocks, tool calls, usage
         """
-        # Handle ChatRequest format
-        if isinstance(messages, ChatRequest):
-            return await self._complete_chat_request(messages, **kwargs)
+        # VALIDATE AND REPAIR: Check for missing tool results (backup safety net)
+        missing = self._find_missing_tool_results(request.messages)
 
-        # Convert messages to Anthropic format
-        anthropic_messages = self._convert_messages(messages)
+        if missing:
+            logger.warning(
+                f"[PROVIDER] Bedrock: Detected {len(missing)} missing tool result(s). "
+                f"Injecting synthetic errors. This indicates a bug in context management. "
+                f"Tool IDs: {[call_id for call_id, _, _ in missing]}"
+            )
 
-        # VALIDATE: Tool consistency before API call (fail fast)
-        try:
-            self._validate_anthropic_tool_consistency(anthropic_messages)
-        except ValueError as e:
-            logger.error(f"Message validation failed before Bedrock API call: {e}")
+            # Inject synthetic results
+            for call_id, tool_name, _ in missing:
+                synthetic = self._create_synthetic_result(call_id, tool_name)
+                request.messages.append(synthetic)
 
-            # Emit validation error event for observability
+            # Emit observability event
             if self.coordinator and hasattr(self.coordinator, "hooks"):
                 await self.coordinator.hooks.emit(
-                    "provider:validation_error",
+                    "provider:tool_sequence_repaired",
                     {
-                        "provider": "bedrock",
-                        "validation": "tool_use_tool_result_consistency",
-                        "error": str(e),
-                        "message_count": len(anthropic_messages),
+                        "provider": self.name,
+                        "repair_count": len(missing),
+                        "repairs": [
+                            {"tool_call_id": call_id, "tool_name": tool_name} for call_id, tool_name, _ in missing
+                        ],
                     },
                 )
 
-            # Fail fast with actionable error
-            raise RuntimeError(
-                f"Cannot send messages to Bedrock API: {e}\n\n"
-                f"This is likely a bug in context compaction. Please report this issue."
-            ) from e
+        return await self._complete_chat_request(request, **kwargs)
 
-        # Extract system message if present
-        system = None
+    def _find_missing_tool_results(self, messages: list) -> list[tuple[str, str, dict]]:
+        """Find tool calls without matching results.
+
+        Scans conversation for assistant tool calls and validates each has
+        a corresponding tool result message. Returns missing pairs.
+
+        Returns:
+            List of (call_id, tool_name, tool_arguments) tuples for unpaired calls
+        """
+        tool_calls = {}  # {call_id: (name, args)}
+        tool_results = set()  # {call_id}
+
         for msg in messages:
-            if msg.get("role") == "system":
-                system = msg.get("content", "")
-                break
+            # Check assistant messages for ToolCallBlock in content
+            if msg.role == "assistant" and isinstance(msg.content, list):
+                for block in msg.content:
+                    if hasattr(block, "type") and block.type == "tool_call":
+                        tool_calls[block.id] = (block.name, block.input)
 
-        # Prepare request parameters
-        base_model = kwargs.get("model", self.default_model)
-        model_with_profile = self._apply_inference_profile(base_model)
-        
-        params = {
-            "model": model_with_profile,
-            "messages": anthropic_messages,
-            "max_tokens": kwargs.get("max_tokens", self.max_tokens),
-            "temperature": kwargs.get("temperature", self.temperature),
-        }
+            # Check tool messages for tool_call_id
+            elif msg.role == "tool" and hasattr(msg, "tool_call_id") and msg.tool_call_id:
+                tool_results.add(msg.tool_call_id)
 
-        if system:
-            params["system"] = system
+        return [(call_id, name, args) for call_id, (name, args) in tool_calls.items() if call_id not in tool_results]
 
-        # Support extended thinking (Anthropic API format)
-        if kwargs.get("extended_thinking"):
-            # Anthropic expects thinking={type: "enabled", budget_tokens: N}
-            budget_tokens = kwargs.get("thinking_budget_tokens", 10000)
-            params["thinking"] = {"type": "enabled", "budget_tokens": budget_tokens}
-            # When thinking is enabled, temperature must be 1
-            params["temperature"] = 1.0
-            # max_tokens must be greater than budget_tokens (add buffer for actual response)
-            if params["max_tokens"] <= budget_tokens:
-                params["max_tokens"] = budget_tokens + 4096  # Budget + response tokens
-            logger.info(
-                f"Extended thinking enabled with budget: {budget_tokens} tokens (temperature=1.0, max_tokens={params['max_tokens']})"
-            )
+    def _create_synthetic_result(self, call_id: str, tool_name: str):
+        """Create synthetic error result for missing tool response.
 
-        # Add tools if provided
-        if "tools" in kwargs:
-            params["tools"] = self._convert_tools(kwargs["tools"])
-
-        logger.info(f"Bedrock API call - model: {params['model']}, thinking: {params.get('thinking')}")
-
-        # Emit llm:request event if coordinator is available
-        if self.coordinator and hasattr(self.coordinator, "hooks"):
-            # INFO level: Summary only
-            await self.coordinator.hooks.emit(
-                "llm:request",
-                {
-                    "data": {
-                        "provider": "bedrock",
-                        "model": params["model"],
-                        "message_count": len(anthropic_messages),
-                        "thinking_enabled": params.get("thinking") is not None,
-                    }
-                },
-            )
-
-            # DEBUG level: Full request payload (if debug enabled)
-            if self.debug:
-                await self.coordinator.hooks.emit(
-                    "llm:request:debug",
-                    {
-                        "lvl": "DEBUG",
-                        "data": {
-                            "provider": "bedrock",
-                            "request": {
-                                "model": params["model"],
-                                "messages": anthropic_messages,
-                                "system": system,
-                                "max_tokens": params["max_tokens"],
-                                "temperature": params["temperature"],
-                                "thinking": params.get("thinking"),
-                            },
-                        },
-                    },
-                )
-
-        # RAW DEBUG: Complete request params sent to Bedrock API (ultra-verbose)
-        if self.coordinator and hasattr(self.coordinator, "hooks") and self.debug and self.raw_debug:
-            await self.coordinator.hooks.emit(
-                "llm:request:raw",
-                {
-                    "lvl": "DEBUG",
-                    "data": {
-                        "provider": "bedrock",
-                        "params": params,  # Complete params dict as-is
-                    },
-                },
-            )
-
-        start_time = time.time()
-        try:
-            response = await asyncio.wait_for(self.client.messages.create(**params), timeout=self.timeout)
-
-            # RAW DEBUG: Complete raw response from Bedrock API (ultra-verbose)
-            if self.coordinator and hasattr(self.coordinator, "hooks") and self.debug and self.raw_debug:
-                await self.coordinator.hooks.emit(
-                    "llm:response:raw",
-                    {
-                        "lvl": "DEBUG",
-                        "data": {
-                            "provider": "bedrock",
-                            "response": response,  # Complete response object as-is
-                        },
-                    },
-                )
-            elapsed_ms = int((time.time() - start_time) * 1000)
-            logger.info(f"Bedrock API response received - content blocks: {len(response.content)}")
-
-            # Convert response to standard format
-            content = ""
-            tool_calls = []
-            content_blocks = []
-            thinking_text = ""
-
-            for block in response.content:
-                logger.info(f"Processing block type: {block.type}")
-                if block.type == "text":
-                    content = block.text
-                    content_blocks.append(TextContent(text=block.text, raw=block))
-                elif block.type == "thinking":
-                    logger.info(f"Found thinking block with {len(block.thinking)} chars")
-                    thinking_text = block.thinking
-                    content_blocks.append(ThinkingContent(text=block.thinking, raw=block))
-
-                    # Emit thinking:final event for the complete thinking block
-                    if self.coordinator and hasattr(self.coordinator, "hooks"):
-                        await self.coordinator.hooks.emit("thinking:final", {"text": block.thinking})
-                elif block.type == "tool_use":
-                    tool_calls.append(ToolCall(tool=block.name, arguments=block.input, id=block.id))
-                    content_blocks.append(
-                        ToolCallContent(id=block.id, name=block.name, arguments=block.input, raw=block)
-                    )
-
-            # Emit llm:response event with success
-            if self.coordinator and hasattr(self.coordinator, "hooks"):
-                # INFO level: Summary only
-                await self.coordinator.hooks.emit(
-                    "llm:response",
-                    {
-                        "data": {
-                            "provider": "bedrock",
-                            "model": params["model"],
-                            "usage": {"input": response.usage.input_tokens, "output": response.usage.output_tokens},
-                            "has_thinking": bool(thinking_text),
-                        },
-                        "status": "ok",
-                        "duration_ms": elapsed_ms,
-                    },
-                )
-
-                # DEBUG level: Full response (if debug enabled)
-                if self.debug:
-                    await self.coordinator.hooks.emit(
-                        "llm:response:debug",
-                        {
-                            "lvl": "DEBUG",
-                            "data": {
-                                "provider": "bedrock",
-                                "response": {
-                                    "content": content,
-                                    "thinking": thinking_text[:500] + "..."
-                                    if len(thinking_text) > 500
-                                    else thinking_text,
-                                    "tool_calls": [{"tool": tc.tool, "id": tc.id} for tc in tool_calls]
-                                    if tool_calls
-                                    else [],
-                                    "stop_reason": response.stop_reason,
-                                },
-                            },
-                            "status": "ok",
-                            "duration_ms": elapsed_ms,
-                        },
-                    )
-
-            return ChatResponse(
-                content=content_blocks if content_blocks else [TextContent(type="text", text=content)],
-                tool_calls=tool_calls if tool_calls else None,
-                usage=Usage(
-                    input_tokens=response.usage.input_tokens,
-                    output_tokens=response.usage.output_tokens,
-                    total_tokens=response.usage.input_tokens + response.usage.output_tokens,
-                ),
-                finish_reason=response.stop_reason,
-            )
-
-        except Exception as e:
-            logger.error(f"Bedrock API error: {e}")
-
-            # Emit llm:response event with error
-            if self.coordinator and hasattr(self.coordinator, "hooks"):
-                await self.coordinator.hooks.emit(
-                    "llm:response",
-                    {
-                        "provider": "bedrock",
-                        "model": params.get("model", self.default_model),
-                        "status": "error",
-                        "duration_ms": int((time.time() - start_time) * 1000),
-                        "error": str(e),
-                    },
-                )
-
-            raise
+        This is a BACKUP for when tool results go missing AFTER execution.
+        The orchestrator should handle tool execution errors at runtime,
+        so this should only trigger on context/parsing bugs.
+        """
+        return Message(
+            role="tool",
+            content=(
+                f"[SYSTEM ERROR: Tool result missing from conversation history]\n\n"
+                f"Tool: {tool_name}\n"
+                f"Call ID: {call_id}\n\n"
+                f"This indicates the tool result was lost after execution.\n"
+                f"Likely causes: context compaction bug, message parsing error, or state corruption.\n\n"
+                f"The tool may have executed successfully, but the result was lost.\n"
+                f"Please acknowledge this error and offer to retry the operation."
+            ),
+            tool_call_id=call_id,
+            name=tool_name,
+        )
 
     async def _complete_chat_request(self, request: ChatRequest, **kwargs) -> ChatResponse:
         """Handle ChatRequest format with developer message conversion.
@@ -449,7 +300,7 @@ class BedrockProvider:
         # Separate messages by role
         system_msgs = [m for m in request.messages if m.role == "system"]
         developer_msgs = [m for m in request.messages if m.role == "developer"]
-        conversation = [m for m in request.messages if m.role in ("user", "assistant")]
+        conversation = [m for m in request.messages if m.role in ("user", "assistant", "tool")]
 
         logger.debug(
             f"Separated: {len(system_msgs)} system, {len(developer_msgs)} developer, {len(conversation)} conversation"
@@ -858,13 +709,6 @@ class BedrockProvider:
         Returns:
             ChatResponse with content blocks
         """
-        from amplifier_core.message_models import (
-            TextBlock,
-            ThinkingBlock,
-            ToolCall,
-            ToolCallBlock,
-            Usage,
-        )
 
         content_blocks = []
         tool_calls = []
@@ -874,7 +718,11 @@ class BedrockProvider:
                 content_blocks.append(TextBlock(text=block.text))
             elif block.type == "thinking":
                 content_blocks.append(
-                    ThinkingBlock(thinking=block.thinking, signature=getattr(block, "signature", None))
+                    ThinkingBlock(
+                        thinking=block.thinking,
+                        signature=getattr(block, "signature", None),
+                        visibility="internal",
+                    )
                 )
             elif block.type == "tool_use":
                 content_blocks.append(ToolCallBlock(id=block.id, name=block.name, input=block.input))
