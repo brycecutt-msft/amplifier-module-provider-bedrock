@@ -1,6 +1,6 @@
 [project]
 name = "amplifier-module-provider-bedrock"
-version = "1.0.0"
+version = "1.0.1"
 description = "AWS Bedrock provider module - Claude and other models via AWS Bedrock for Amplifier"
 license = "MIT"
 readme = "README.md"
@@ -43,3 +43,6 @@ packages = [
 
 [tool.hatch.metadata]
 allow-direct-references = true
+
+[tool.uv.sources]
+amplifier-core = { git = "https://github.com/microsoft/amplifier-core", branch = "main" }

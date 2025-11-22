@@ -196,7 +196,7 @@ git clone https://github.com/brycecutt-msft/amplifier-module-provider-bedrock.gi
 cd amplifier-module-provider-bedrock
 
 # Install dependencies
-uv sync
+uv sync --extra dev
 
 # Run tests
 uv run pytest

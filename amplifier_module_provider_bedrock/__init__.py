@@ -12,9 +12,9 @@ import os
 import time
 from typing import Any
 
-from amplifier_core import ModuleCoordinator, ProviderResponse, ToolCall
+from amplifier_core import ModuleCoordinator
 from amplifier_core.content_models import TextContent, ThinkingContent, ToolCallContent
-from amplifier_core.message_models import ChatRequest, ChatResponse
+from amplifier_core.message_models import ChatRequest, ChatResponse, ToolCall, Usage
 from anthropic import AsyncAnthropicBedrock
 
 logger = logging.getLogger(__name__)
@@ -189,7 +189,7 @@ class BedrockProvider:
         return model_id
 
 
-    async def complete(self, messages: list[dict[str, Any]] | ChatRequest, **kwargs) -> ProviderResponse | ChatResponse:
+    async def complete(self, messages: list[dict[str, Any]] | ChatRequest, **kwargs) -> ChatResponse:
         """
         Generate completion from messages.
 
@@ -405,12 +405,15 @@ class BedrockProvider:
                         },
                     )
 
-            return ProviderResponse(
-                content=content,
-                raw=response,
-                usage={"input": response.usage.input_tokens, "output": response.usage.output_tokens},
+            return ChatResponse(
+                content=content_blocks if content_blocks else [TextContent(type="text", text=content)],
                 tool_calls=tool_calls if tool_calls else None,
-                content_blocks=content_blocks if content_blocks else None,
+                usage=Usage(
+                    input_tokens=response.usage.input_tokens,
+                    output_tokens=response.usage.output_tokens,
+                    total_tokens=response.usage.input_tokens + response.usage.output_tokens,
+                ),
+                finish_reason=response.stop_reason,
             )
 
         except Exception as e:
@@ -604,7 +607,7 @@ class BedrockProvider:
                 )
             raise
 
-    def parse_tool_calls(self, response: ProviderResponse) -> list[ToolCall]:
+    def parse_tool_calls(self, response: ChatResponse) -> list[ToolCall]:
         """
         Parse tool calls from provider response.
 
