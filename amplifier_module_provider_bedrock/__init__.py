@@ -563,6 +563,57 @@ class BedrockProvider:
 
             i += 1
 
+    def _clean_content_block(self, block: dict[str, Any]) -> dict[str, Any]:
+        """Clean a content block for API by removing fields not accepted by Bedrock API.
+
+        Bedrock API may include extra fields (like 'visibility') in responses,
+        but does NOT accept these fields when blocks are sent as input in messages.
+        Also ensures text fields are valid strings.
+
+        Args:
+            block: Raw content block dict (may include visibility, nested text, etc.)
+
+        Returns:
+            Cleaned content block dict with only API-accepted fields
+        """
+        block_type = block.get("type")
+
+        if block_type == "text":
+            text_value = block.get("text", "")
+            # Handle nested text objects like {"text": {"text": "..."}}
+            while isinstance(text_value, dict) and "text" in text_value:
+                text_value = text_value["text"]
+            # Ensure it's a string
+            if not isinstance(text_value, str):
+                text_value = str(text_value) if text_value is not None else ""
+            return {"type": "text", "text": text_value}
+        if block_type == "thinking":
+            cleaned = {"type": "thinking", "thinking": block.get("thinking", "")}
+            if "signature" in block:
+                cleaned["signature"] = block["signature"]
+            return cleaned
+        if block_type == "tool_use":
+            return {
+                "type": "tool_use",
+                "id": block.get("id", ""),
+                "name": block.get("name", ""),
+                "input": block.get("input", {}),
+            }
+        if block_type == "tool_result":
+            content = block.get("content", "")
+            # Ensure content is a string
+            if not isinstance(content, str):
+                content = str(content) if content is not None else ""
+            return {
+                "type": "tool_result",
+                "tool_use_id": block.get("tool_use_id", ""),
+                "content": content,
+            }
+        # Unknown block type - return as-is but remove visibility
+        cleaned = dict(block)
+        cleaned.pop("visibility", None)
+        return cleaned
+
     def _convert_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Convert messages to Anthropic format.
 
@@ -596,11 +647,16 @@ class BedrockProvider:
                         logger.warning(f"Tool result missing tool_call_id: {tool_msg}")
                         tool_use_id = "unknown"  # Fallback
 
+                    # Sanitize tool result content - ensure it's a string
+                    tool_content = tool_msg.get("content", "")
+                    if not isinstance(tool_content, str):
+                        tool_content = str(tool_content) if tool_content is not None else ""
+
                     tool_results.append(
                         {
                             "type": "tool_result",
                             "tool_use_id": tool_use_id,
-                            "content": tool_msg.get("content", ""),
+                            "content": tool_content,
                         }
                     )
                     i += 1
@@ -621,12 +677,23 @@ class BedrockProvider:
 
                     # CRITICAL: Check for thinking block and add it FIRST
                     if "thinking_block" in msg and msg["thinking_block"]:
-                        # Use the raw thinking block which includes signature
-                        content_blocks.append(msg["thinking_block"])
+                        # Clean thinking block (remove visibility field not accepted by API)
+                        cleaned_thinking = self._clean_content_block(msg["thinking_block"])
+                        content_blocks.append(cleaned_thinking)
 
                     # Add text content if present
                     if content:
-                        content_blocks.append({"type": "text", "text": content})
+                        if isinstance(content, list):
+                            # Content is a list of blocks - extract text blocks only
+                            for block in content:
+                                if isinstance(block, dict) and block.get("type") == "text":
+                                    cleaned_block = self._clean_content_block(block)
+                                    content_blocks.append(cleaned_block)
+                                elif not isinstance(block, dict) and hasattr(block, "type") and block.type == "text":
+                                    content_blocks.append({"type": "text", "text": str(getattr(block, "text", ""))})
+                        else:
+                            # Content is a simple string
+                            content_blocks.append({"type": "text", "text": str(content)})
 
                     # Add tool_use blocks
                     for tc in msg["tool_calls"]:
@@ -642,22 +709,43 @@ class BedrockProvider:
                     anthropic_messages.append({"role": "assistant", "content": content_blocks})
                 elif "thinking_block" in msg and msg["thinking_block"]:
                     # Assistant message with thinking block
-                    content_blocks = [msg["thinking_block"]]
+                    # Clean thinking block (remove visibility field not accepted by API)
+                    cleaned_thinking = self._clean_content_block(msg["thinking_block"])
+                    content_blocks = [cleaned_thinking]
                     if content:
-                        content_blocks.append({"type": "text", "text": content})
+                        if isinstance(content, list):
+                            # Content is a list of blocks - extract text blocks only
+                            for block in content:
+                                if isinstance(block, dict) and block.get("type") == "text":
+                                    cleaned_block = self._clean_content_block(block)
+                                    content_blocks.append(cleaned_block)
+                                elif not isinstance(block, dict) and hasattr(block, "type") and block.type == "text":
+                                    content_blocks.append({"type": "text", "text": str(getattr(block, "text", ""))})
+                        else:
+                            # Content is a simple string
+                            content_blocks.append({"type": "text", "text": str(content)})
                     anthropic_messages.append({"role": "assistant", "content": content_blocks})
                 else:
-                    # Regular assistant message
-                    anthropic_messages.append({"role": "assistant", "content": content})
+                    # Regular assistant message - may have structured content blocks
+                    if isinstance(content, list):
+                        # Content is a list of blocks - clean each block
+                        cleaned_blocks = [self._clean_content_block(block) for block in content]
+                        anthropic_messages.append({"role": "assistant", "content": cleaned_blocks})
+                    else:
+                        # Content is a simple string
+                        anthropic_messages.append({"role": "assistant", "content": str(content)})
                 i += 1
             elif role == "developer":
                 # Developer messages -> XML-wrapped user messages (context files)
-                wrapped = f"<context_file>\n{content}\n</context_file>"
+                # Ensure content is a string
+                content_str = str(content) if not isinstance(content, str) else content
+                wrapped = f"<context_file>\n{content_str}\n</context_file>"
                 anthropic_messages.append({"role": "user", "content": wrapped})
                 i += 1
             else:
-                # User messages
-                anthropic_messages.append({"role": "user", "content": content})
+                # User messages - ensure content is a string
+                content_str = str(content) if not isinstance(content, str) else content
+                anthropic_messages.append({"role": "user", "content": content_str})
                 i += 1
 
         return anthropic_messages
