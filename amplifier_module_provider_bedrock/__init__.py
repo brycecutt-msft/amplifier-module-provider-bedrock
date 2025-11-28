@@ -12,11 +12,14 @@ import os
 import time
 from typing import Any
 
-from amplifier_core import ModuleCoordinator
+from amplifier_core import ConfigField, ModelInfo, ModuleCoordinator, ProviderInfo
 from amplifier_core.message_models import (
     ChatRequest,
     ChatResponse,
+    ImageBlock,
     Message,
+    ReasoningBlock,
+    RedactedThinkingBlock,
     TextBlock,
     ThinkingBlock,
     ToolCall,
@@ -143,6 +146,81 @@ class BedrockProvider:
             prefix = self._get_inference_profile_prefix(self.aws_region)
             if prefix:
                 logger.info(f"Cross-region inference enabled - will use prefix '{prefix}' for model IDs in region '{self.aws_region}'")
+
+    def get_info(self) -> ProviderInfo:
+        """Get provider metadata."""
+        return ProviderInfo(
+            id="bedrock",
+            display_name="AWS Bedrock",
+            credential_env_vars=["AWS_PROFILE", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_REGION"],
+            capabilities=["streaming", "tools", "thinking", "vision"],
+            defaults={
+                "model": "anthropic.claude-sonnet-4-5-20250929-v1:0",
+                "max_tokens": 4096,
+                "temperature": 0.7,
+                "timeout": 300.0,
+            },
+            config_fields=[
+                ConfigField(
+                    id="aws_profile",
+                    display_name="AWS Profile",
+                    field_type="text",
+                    prompt="Enter AWS profile name (optional, uses default if not specified)",
+                    env_var="AWS_PROFILE",
+                    required=False,
+                ),
+                ConfigField(
+                    id="aws_region",
+                    display_name="AWS Region",
+                    field_type="text",
+                    prompt="Enter AWS region (e.g., us-east-1)",
+                    env_var="AWS_REGION",
+                    default="us-east-1",
+                    required=False,
+                ),
+                ConfigField(
+                    id="use_cross_region_inference",
+                    display_name="Cross-Region Inference",
+                    field_type="boolean",
+                    prompt="Enable cross-region inference for better availability?",
+                    default="true",
+                    required=False,
+                ),
+            ],
+        )
+
+    async def list_models(self) -> list[ModelInfo]:
+        """
+        List available Claude models on AWS Bedrock.
+        
+        Returns hardcoded list since Bedrock doesn't provide dynamic model discovery.
+        """
+        return [
+            ModelInfo(
+                id="anthropic.claude-sonnet-4-5-20250929-v1:0",
+                display_name="Claude Sonnet 4.5",
+                context_window=200000,
+                max_output_tokens=16000,
+                capabilities=["tools", "vision", "thinking", "streaming"],
+                defaults={"temperature": 0.7, "max_tokens": 4096},
+            ),
+            ModelInfo(
+                id="anthropic.claude-opus-4-1-20250805-v1:0",
+                display_name="Claude Opus 4.1",
+                context_window=200000,
+                max_output_tokens=32000,
+                capabilities=["tools", "vision", "thinking", "streaming"],
+                defaults={"temperature": 0.7, "max_tokens": 4096},
+            ),
+            ModelInfo(
+                id="anthropic.claude-haiku-4-5-20251001-v1:0",
+                display_name="Claude Haiku 4.5",
+                context_window=200000,
+                max_output_tokens=8192,
+                capabilities=["tools", "vision", "streaming", "fast"],
+                defaults={"temperature": 0.7, "max_tokens": 4096},
+            ),
+        ]
 
     def _get_inference_profile_prefix(self, region: str) -> str | None:
         """
