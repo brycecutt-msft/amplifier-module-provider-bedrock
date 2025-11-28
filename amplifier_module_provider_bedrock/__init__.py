@@ -44,6 +44,13 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
     """
     config = config or {}
 
+    # Register contribution channel for custom events
+    coordinator.register_contributor(
+        "observability.events",
+        "bedrock",
+        lambda: ["provider:tool_sequence_repaired"]
+    )
+
     provider = BedrockProvider(config, coordinator)
     provider_name = config.get("name", "bedrock")
     await coordinator.mount("providers", provider, name=provider_name)
@@ -470,6 +477,17 @@ class BedrockProvider:
                     },
                 )
 
+            # RAW level: Complete params dict as sent to Bedrock API (if debug AND raw_debug enabled)
+            if self.debug and self.raw_debug:
+                await self.coordinator.hooks.emit(
+                    "llm:request:raw",
+                    {
+                        "lvl": "DEBUG",
+                        "provider": "bedrock",
+                        "params": params,  # Complete untruncated params
+                    },
+                )
+
         start_time = time.time()
 
         # Call Bedrock API
@@ -512,6 +530,17 @@ class BedrockProvider:
                             },
                             "status": "ok",
                             "duration_ms": elapsed_ms,
+                        },
+                    )
+
+                # RAW level: Complete response object from Bedrock API (if debug AND raw_debug enabled)
+                if self.debug and self.raw_debug:
+                    await self.coordinator.hooks.emit(
+                        "llm:response:raw",
+                        {
+                            "lvl": "DEBUG",
+                            "provider": "bedrock",
+                            "response": response.model_dump(),  # Complete untruncated response
                         },
                     )
 
