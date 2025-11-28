@@ -699,6 +699,22 @@ class BedrockProvider:
             if "signature" in block:
                 cleaned["signature"] = block["signature"]
             return cleaned
+        if block_type == "reasoning":
+            return {
+                "type": "reasoning",
+                "content": block.get("content", []),
+                "summary": block.get("summary", []),
+            }
+        if block_type == "redacted_thinking":
+            return {
+                "type": "redacted_thinking",
+                "data": block.get("data", ""),
+            }
+        if block_type == "image":
+            return {
+                "type": "image",
+                "source": block.get("source", {}),
+            }
         if block_type == "tool_use":
             return {
                 "type": "tool_use",
@@ -917,6 +933,25 @@ class BedrockProvider:
                         thinking=block.thinking,
                         signature=getattr(block, "signature", None),
                         visibility="internal",
+                    )
+                )
+            elif block.type == "reasoning":
+                content_blocks.append(
+                    ReasoningBlock(
+                        content=block.content,
+                        summary=block.summary,
+                    )
+                )
+            elif block.type == "redacted_thinking":
+                content_blocks.append(
+                    RedactedThinkingBlock(
+                        data=block.data,
+                    )
+                )
+            elif block.type == "image":
+                content_blocks.append(
+                    ImageBlock(
+                        source=block.source,
                     )
                 )
             elif block.type == "tool_use":
