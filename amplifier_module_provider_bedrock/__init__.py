@@ -40,7 +40,7 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
         config: Provider configuration including AWS credentials
 
     Returns:
-        Optional cleanup function
+        Optional cleanup function, or None if credentials unavailable (graceful degradation)
     """
     config = config or {}
 
@@ -53,6 +53,23 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
             "provider:continuation"
         ]
     )
+
+    # Check for AWS credentials before attempting to create provider
+    # Gracefully degrade if not available
+    has_profile = config.get("aws_profile") or os.environ.get("AWS_PROFILE")
+    has_explicit_keys = (
+        config.get("aws_access_key") or os.environ.get("AWS_ACCESS_KEY_ID")
+    ) and (
+        config.get("aws_secret_key") or os.environ.get("AWS_SECRET_ACCESS_KEY")
+    )
+    
+    if not has_profile and not has_explicit_keys:
+        logger.warning(
+            "AWS Bedrock provider not mounted: No AWS credentials found. "
+            "Set AWS_PROFILE, AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY environment variables, "
+            "or provide aws_profile/aws_access_key in config."
+        )
+        return None
 
     provider = BedrockProvider(config, coordinator)
     provider_name = config.get("name", "bedrock")
