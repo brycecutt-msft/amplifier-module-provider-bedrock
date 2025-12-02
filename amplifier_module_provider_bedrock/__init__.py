@@ -48,7 +48,10 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
     coordinator.register_contributor(
         "observability.events",
         "bedrock",
-        lambda: ["provider:tool_sequence_repaired"]
+        lambda: [
+            "provider:tool_sequence_repaired",
+            "provider:continuation"
+        ]
     )
 
     provider = BedrockProvider(config, coordinator)
@@ -498,6 +501,85 @@ class BedrockProvider:
             logger.info("[PROVIDER] Received response from Bedrock API")
             logger.debug(f"[PROVIDER] Response type: {response.model}")
 
+            # Handle auto-continuation for truncated responses
+            accumulated_content = list(response.content)
+            accumulated_input_tokens = response.usage.input_tokens
+            accumulated_output_tokens = response.usage.output_tokens
+            continuation_count = 0
+            MAX_CONTINUATION_ATTEMPTS = 5
+            
+            while response.stop_reason in ["max_tokens", "length"] and continuation_count < MAX_CONTINUATION_ATTEMPTS:
+                continuation_count += 1
+                logger.info(
+                    f"[PROVIDER] Response incomplete (stop_reason={response.stop_reason}), "
+                    f"continuing (attempt {continuation_count}/{MAX_CONTINUATION_ATTEMPTS})"
+                )
+                
+                # Emit continuation event
+                if self.coordinator and hasattr(self.coordinator, "hooks"):
+                    await self.coordinator.hooks.emit(
+                        "provider:continuation",
+                        {
+                            "provider": "bedrock",
+                            "continuation_number": continuation_count,
+                            "stop_reason": response.stop_reason,
+                        },
+                    )
+                
+                # Build continuation messages: original messages + assistant response so far
+                continuation_messages = all_messages + [
+                    {
+                        "role": "assistant",
+                        "content": [self._convert_content_block_to_api(block) for block in accumulated_content],
+                    }
+                ]
+                
+                # Make continuation call with same params but updated messages
+                continuation_params = dict(params)
+                continuation_params["messages"] = continuation_messages
+                
+                try:
+                    response = await asyncio.wait_for(
+                        self.client.messages.create(**continuation_params),
+                        timeout=self.timeout
+                    )
+                    
+                    # Accumulate content and usage
+                    accumulated_content.extend(response.content)
+                    accumulated_input_tokens += response.usage.input_tokens
+                    accumulated_output_tokens += response.usage.output_tokens
+                    
+                except Exception as e:
+                    logger.warning(
+                        f"[PROVIDER] Continuation {continuation_count} failed: {e}. "
+                        f"Returning partial response."
+                    )
+                    break
+            
+            # If we did continuations, build final response from accumulated data
+            if continuation_count > 0:
+                logger.info(
+                    f"[PROVIDER] Completed after {continuation_count} continuation(s), "
+                    f"total output tokens: {accumulated_output_tokens}"
+                )
+                # Create a simple object to hold accumulated data
+                class AccumulatedResponse:
+                    def __init__(self, content, stop_reason, input_tokens, output_tokens):
+                        self.content = content
+                        self.stop_reason = stop_reason
+                        class Usage:
+                            def __init__(self, input_tok, output_tok):
+                                self.input_tokens = input_tok
+                                self.output_tokens = output_tok
+                        self.usage = Usage(input_tokens, output_tokens)
+                
+                response = AccumulatedResponse(
+                    accumulated_content,
+                    response.stop_reason,
+                    accumulated_input_tokens,
+                    accumulated_output_tokens
+                )
+
             # Emit llm:response event
             if self.coordinator and hasattr(self.coordinator, "hooks"):
                 # INFO level: Summary only
@@ -736,6 +818,46 @@ class BedrockProvider:
         cleaned = dict(block)
         cleaned.pop("visibility", None)
         return cleaned
+
+    def _convert_content_block_to_api(self, block: Any) -> dict[str, Any]:
+        """Convert a content block object back to API dict format for continuation.
+        
+        Args:
+            block: Content block from API response
+            
+        Returns:
+            Dict suitable for sending back to API
+        """
+        if hasattr(block, 'type'):
+            if block.type == "text":
+                return {"type": "text", "text": block.text}
+            elif block.type == "thinking":
+                result = {"type": "thinking", "thinking": block.thinking}
+                if hasattr(block, 'signature') and block.signature:
+                    result["signature"] = block.signature
+                return result
+            elif block.type == "reasoning":
+                return {
+                    "type": "reasoning",
+                    "content": block.content,
+                    "summary": block.summary
+                }
+            elif block.type == "redacted_thinking":
+                return {"type": "redacted_thinking", "data": block.data}
+            elif block.type == "image":
+                return {"type": "image", "source": block.source}
+            elif block.type == "tool_use":
+                return {
+                    "type": "tool_use",
+                    "id": block.id,
+                    "name": block.name,
+                    "input": block.input
+                }
+        
+        # Fallback: return as dict
+        if hasattr(block, 'model_dump'):
+            return block.model_dump()
+        return dict(block)
 
     def _convert_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Convert messages to Anthropic format.
