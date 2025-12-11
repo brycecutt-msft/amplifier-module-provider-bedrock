@@ -1,33 +1,35 @@
 # Amplifier AWS Bedrock Provider Module
 
-Claude model integration for Amplifier via AWS Bedrock.
+Access Anthropic's Claude models via AWS Bedrock as an AI provider for Amplifier.
 
 ## Prerequisites
 
-- **Python 3.11+**
-- **[UV](https://github.com/astral-sh/uv)** - Fast Python package manager
-- **AWS Account** with Bedrock access
+- **[Amplifier](https://github.com/microsoft/amplifier)** - Install with `uv tool install git+https://github.com/microsoft/amplifier`
+  - See [Amplifier Installation Guide](https://github.com/microsoft/amplifier#quick-start---zero-to-working-in-90-seconds) for full setup
+- **AWS Account** with [Bedrock access](https://docs.aws.amazon.com/bedrock/latest/userguide/setting-up.html)
 - **AWS Credentials** - See [AWS Authentication](#aws-authentication)
 
-### Installing UV
+## Installation
 
 ```bash
-# macOS/Linux/WSL
-curl -LsSf https://astral.sh/uv/install.sh | sh
+amplifier module add provider-bedrock \
+  --source git+https://github.com/brycecutt-msft/amplifier-module-provider-bedrock
 
-# Windows
-powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
+amplifier provider use bedrock
 ```
 
-## Purpose
+The interactive setup will prompt for:
+- **AWS Profile** - Your AWS profile name (or press Enter to use default)
+- **AWS Region** - AWS region (default: us-east-1)
+- **Cross-Region Inference** - Enable for better availability (recommended: yes)
 
-Provides access to Anthropic's Claude models via AWS Bedrock as an LLM provider for Amplifier.
+> **Note:** By default, this installs for your current project. Use `--global`, `--project`, or `--local` flags to control scope. See [Amplifier Configuration](https://github.com/microsoft/amplifier#configuration) for details.
 
-## Contract
+## Quick Test
 
-**Module Type:** Provider  
-**Mount Point:** `providers`  
-**Entry Point:** `amplifier_module_provider_bedrock:mount`
+```bash
+amplifier run "What is 2+2?"
+```
 
 ## Supported Models
 
@@ -37,169 +39,152 @@ Provides access to Anthropic's Claude models via AWS Bedrock as an LLM provider 
 
 > **Note:** Model availability varies by AWS region. See [AWS Bedrock Models](https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html) for the complete list.
 
-## Cross-Region Inference
-
-AWS Bedrock supports [cross-region inference](https://docs.aws.amazon.com/bedrock/latest/userguide/inference-profiles-support.html) which routes requests to the nearest available region with capacity. This feature is **enabled by default**.
-
-When enabled, the provider automatically prefixes model IDs with the appropriate inference profile based on your region:
-
-| Region Pattern | Inference Prefix | Example |
-|---------------|------------------|---------|
-| `us-east-1`, `us-west-2` | `us.` | `us.anthropic.claude-sonnet-4-5-20250929-v1:0` |
-| `eu-west-1`, `eu-central-1` | `eu.` | `eu.anthropic.claude-sonnet-4-5-20250929-v1:0` |
-| `ap-southeast-1`, `ap-south-1` | `apac.` | `apac.anthropic.claude-sonnet-4-5-20250929-v1:0` |
-
-You only need to specify the base model ID. The inference profile prefix is automatically applied.
-
-To disable cross-region inference:
-
-```toml
-config = {
-    use_cross_region_inference = false,
-    aws_region = "us-east-1",
-    default_model = "anthropic.claude-sonnet-4-5-20250929-v1:0"
-}
-```
-
 ## Features
 
-- ✅ **AWS Profile Support** - SSO and standard profiles
-- ✅ **Multiple Auth Methods** - Profiles, environment variables, IAM roles
-- ✅ **Extended Thinking** - Claude's internal reasoning (when supported)
-- ✅ **Tool Calling** - Function calling capabilities
-- ✅ **Streaming Support** - Real-time response streaming
-- ✅ **Message Validation** - Defense-in-depth validation before API calls
-- ✅ **Token Management** - Usage tracking and limits
+- ✅ **Multiple AWS Auth Methods** - SSO, profiles, environment variables, IAM roles
+- ✅ **Extended Thinking** - Claude's internal reasoning (when supported by model)
+- ✅ **Tool Calling** - Function calling with automatic validation
+- ✅ **Streaming** - Real-time response streaming
 - ✅ **Cross-Region Inference** - Automatic routing for best availability
+- ✅ **Usage Tracking** - Token counting and limits
 
-## Message Validation
+## Advanced Configuration
 
-Before sending messages to Bedrock API, the provider validates tool_use/tool_result consistency:
+You can customize the provider in your Amplifier profile or settings:
 
-- Each `tool_use` must have a corresponding `tool_result` in the next message
-- Prevents API errors from malformed message sequences
-- Provides actionable error messages for debugging
-
-## Configuration
-
-```toml
-[[providers]]
-module = "provider-bedrock"
-name = "bedrock"
-config = {
-    aws_profile = "my-profile",  # Optional: AWS profile name
-    aws_region = "us-east-1",    # Optional: defaults to profile/environment
-    default_model = "anthropic.claude-sonnet-4-5-20250929-v1:0",
-    use_cross_region_inference = true,  # Default: true
-    max_tokens = 8192,
-    temperature = 1.0,
-    debug = false,      # Enable standard debug events
-    raw_debug = false   # Enable ultra-verbose raw API I/O logging
-}
-```
-
-### Debug Configuration
-
-**Standard Debug** (`debug: true`):
-- Emits `llm:request:debug` and `llm:response:debug` events
-- Contains request/response summaries with message counts, model info, usage stats
-- Moderate log volume, suitable for development
-
-**Raw Debug** (`debug: true, raw_debug: true`):
-- Emits `llm:request:raw` and `llm:response:raw` events
-- Contains complete, unmodified request params and response objects
-- Extreme log volume, use only for deep provider integration debugging
-- Captures the exact data sent to/from Bedrock API before any processing
-
-**Example**:
-```toml
-[[providers]]
-module = "provider-bedrock"
-name = "bedrock"
-config = {
-    aws_profile = "my-profile",
-    debug = true,      # Enable debug events
-    raw_debug = true,  # Enable raw API I/O capture
-    default_model = "anthropic.claude-sonnet-4-5-20250929-v1:0"
-}
+```yaml
+# .amplifier/settings.yaml
+config:
+  providers:
+  - module: provider-bedrock
+    config:
+      aws_profile: my-profile           # Optional: AWS profile name
+      aws_region: us-east-1             # Optional: defaults to profile/environment
+      default_model: anthropic.claude-sonnet-4-5-20250929-v1:0
+      use_cross_region_inference: true  # Default: true
+      max_tokens: 8192
+      temperature: 1.0
+      debug: false                      # Enable debug logging
 ```
 
 ## AWS Authentication
 
-**Recommended: AWS IAM Identity Center (SSO)**
-
-The most secure way to authenticate is using [AWS IAM Identity Center (SSO)](https://docs.aws.amazon.com/cli/latest/userguide/sso-configure-profile-token.html):
+### Recommended: AWS SSO
 
 ```bash
 aws configure sso
+aws sso login --profile your-profile
 ```
 
-This provides secure, temporary credentials without managing long-term access keys.
+### Alternative Methods
 
-**Alternative Authentication Methods:**
+The provider supports all standard AWS authentication:
+- AWS profiles (SSO or access keys)
+- Environment variables (`AWS_PROFILE`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`)
+- IAM roles (EC2, ECS, Lambda)
 
-The provider uses standard AWS credential resolution:
-- AWS profiles (SSO or standard)
-- Environment variables (`AWS_PROFILE`, `AWS_ACCESS_KEY_ID`, etc.)
-- IAM roles (EC2, ECS, Lambda, etc.)
+See [AWS CLI Configuration](https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-files.html).
 
-For details, see [AWS CLI Configuration](https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-files.html).
+### Required Permissions
 
-## AWS Permissions
-
-Your AWS credentials need Bedrock permissions. See [AWS Bedrock IAM](https://docs.aws.amazon.com/bedrock/latest/userguide/security-iam.html) for details.
-
-Minimum required actions:
+Your AWS credentials need:
 - `bedrock:InvokeModel`
 - `bedrock:InvokeModelWithResponseStream`
 
-## Differences from Direct Anthropic Provider
+See [AWS Bedrock IAM](https://docs.aws.amazon.com/bedrock/latest/userguide/security-iam.html).
 
-- **Model IDs**: Bedrock uses AWS-specific model IDs (e.g., `anthropic.claude-sonnet-4-5-20250929-v1:0`)
-- **Authentication**: Uses AWS credentials instead of Anthropic API key
-- **Regions**: Must specify AWS region
-- **Pricing**: Billed through AWS, may differ from direct Anthropic API
-- **Rate Limits**: Subject to AWS Bedrock quotas
+## Cross-Region Inference
 
-## Dependencies
+AWS Bedrock's [cross-region inference](https://docs.aws.amazon.com/bedrock/latest/userguide/inference-profiles-support.html) is **enabled by default**, routing requests to the nearest available region with capacity.
 
-- `amplifier-core>=1.0.0`
-- `anthropic[bedrock]>=0.72.0`
-- `boto3>=1.40.0`
-- `botocore>=1.40.0`
+The provider automatically prefixes model IDs based on your region:
+
+| Region Pattern | Prefix | Example |
+|---------------|--------|---------|
+| `us-*` | `us.` | `us.anthropic.claude-sonnet-4-5-20250929-v1:0` |
+| `eu-*` | `eu.` | `eu.anthropic.claude-sonnet-4-5-20250929-v1:0` |
+| `ap-*` | `apac.` | `apac.anthropic.claude-sonnet-4-5-20250929-v1:0` |
+
+You only specify the base model ID—the prefix is automatic.
+
+## Differences from Anthropic Provider
+
+- **Model IDs**: AWS-specific (e.g., `anthropic.claude-sonnet-4-5-20250929-v1:0`)
+- **Authentication**: AWS credentials instead of Anthropic API key
+- **Billing**: Through AWS, pricing may differ
+- **Rate Limits**: AWS Bedrock quotas apply
+
+## Updating
+
+```bash
+# Update to latest version
+amplifier module update
+
+# Or reinstall specific version
+amplifier module remove provider-bedrock
+amplifier module add provider-bedrock --source git+https://...@v1.1.0 --local
+```
 
 ## Troubleshooting
 
-### "No AWS region found"
-- Set `aws_region` in config, or
-- Configure region in your [AWS profile](https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-files.html), or
-- Set `AWS_REGION` environment variable
+### "Token has expired and refresh failed"
+Your AWS SSO token expired:
+```bash
+aws sso login --profile your-profile
+```
+
+### "No module named 'anthropic'"
+You installed from a local file source. Use git source instead:
+```bash
+amplifier module remove provider-bedrock
+amplifier module add provider-bedrock --source git+https://...@main --local
+```
 
 ### "Access Denied"
-- Verify your AWS credentials have [Bedrock permissions](https://docs.aws.amazon.com/bedrock/latest/userguide/security-iam.html)
-- Ensure model access is enabled in [AWS Bedrock console](https://console.aws.amazon.com/bedrock/)
-
-### "Profile not found"
-- Verify profile exists in your [AWS configuration](https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-files.html)
-- Check profile name spelling (case-sensitive)
+- Check [Bedrock permissions](https://docs.aws.amazon.com/bedrock/latest/userguide/security-iam.html)
+- Enable model access in [AWS Bedrock console](https://console.aws.amazon.com/bedrock/)
 
 ### "Model not found"
-- Request model access in [AWS Bedrock console](https://console.aws.amazon.com/bedrock/)
-- Verify model ID is correct for your region
-- See [supported models documentation](https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html)
+- Request access in [AWS Bedrock console](https://console.aws.amazon.com/bedrock/)
+- Check [model availability](https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html) in your region
 
 ## Development
 
+### Quick Start
+
 ```bash
-# Clone the repository
+# Clone repository
 git clone https://github.com/brycecutt-msft/amplifier-module-provider-bedrock.git
 cd amplifier-module-provider-bedrock
 
-# Install dependencies
+# Create feature branch
+git checkout -b feat/my-feature
+
+# Make changes, commit, and push
+git add .
+git commit -m "feat: add new feature"
+git push origin feat/my-feature
+
+# Test your changes
+amplifier module remove provider-bedrock
+amplifier module add provider-bedrock \
+  --source git+https://github.com/brycecutt-msft/amplifier-module-provider-bedrock@feat/my-feature \
+  --local
+
+amplifier run "test query"
+```
+
+### Testing
+
+```bash
+# Install dev dependencies
 uv sync --extra dev
 
 # Run tests
 uv run pytest
+
+# Run with coverage
+uv run pytest --cov=amplifier_module_provider_bedrock
 ```
 
 ## License

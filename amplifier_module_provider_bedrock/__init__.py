@@ -12,11 +12,14 @@ import os
 import time
 from typing import Any
 
-from amplifier_core import ModuleCoordinator
+from amplifier_core import ConfigField, ModelInfo, ModuleCoordinator, ProviderInfo
 from amplifier_core.message_models import (
     ChatRequest,
     ChatResponse,
+    ImageBlock,
     Message,
+    ReasoningBlock,
+    RedactedThinkingBlock,
     TextBlock,
     ThinkingBlock,
     ToolCall,
@@ -37,9 +40,36 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
         config: Provider configuration including AWS credentials
 
     Returns:
-        Optional cleanup function
+        Optional cleanup function, or None if credentials unavailable (graceful degradation)
     """
     config = config or {}
+
+    # Register contribution channel for custom events
+    coordinator.register_contributor(
+        "observability.events",
+        "bedrock",
+        lambda: [
+            "provider:tool_sequence_repaired",
+            "provider:continuation"
+        ]
+    )
+
+    # Check for AWS credentials before attempting to create provider
+    # Gracefully degrade if not available
+    has_profile = config.get("aws_profile") or os.environ.get("AWS_PROFILE")
+    has_explicit_keys = (
+        config.get("aws_access_key") or os.environ.get("AWS_ACCESS_KEY_ID")
+    ) and (
+        config.get("aws_secret_key") or os.environ.get("AWS_SECRET_ACCESS_KEY")
+    )
+    
+    if not has_profile and not has_explicit_keys:
+        logger.warning(
+            "AWS Bedrock provider not mounted: No AWS credentials found. "
+            "Set AWS_PROFILE, AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY environment variables, "
+            "or provide aws_profile/aws_access_key in config."
+        )
+        return None
 
     provider = BedrockProvider(config, coordinator)
     provider_name = config.get("name", "bedrock")
@@ -143,6 +173,81 @@ class BedrockProvider:
             prefix = self._get_inference_profile_prefix(self.aws_region)
             if prefix:
                 logger.info(f"Cross-region inference enabled - will use prefix '{prefix}' for model IDs in region '{self.aws_region}'")
+
+    def get_info(self) -> ProviderInfo:
+        """Get provider metadata."""
+        return ProviderInfo(
+            id="bedrock",
+            display_name="AWS Bedrock",
+            credential_env_vars=["AWS_PROFILE", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_REGION"],
+            capabilities=["streaming", "tools", "thinking", "vision"],
+            defaults={
+                "model": "anthropic.claude-sonnet-4-5-20250929-v1:0",
+                "max_tokens": 4096,
+                "temperature": 0.7,
+                "timeout": 300.0,
+            },
+            config_fields=[
+                ConfigField(
+                    id="aws_profile",
+                    display_name="AWS Profile",
+                    field_type="text",
+                    prompt="Enter AWS profile name (optional, uses default if not specified)",
+                    env_var="AWS_PROFILE",
+                    required=False,
+                ),
+                ConfigField(
+                    id="aws_region",
+                    display_name="AWS Region",
+                    field_type="text",
+                    prompt="Enter AWS region (e.g., us-east-1)",
+                    env_var="AWS_REGION",
+                    default="us-east-1",
+                    required=False,
+                ),
+                ConfigField(
+                    id="use_cross_region_inference",
+                    display_name="Cross-Region Inference",
+                    field_type="boolean",
+                    prompt="Enable cross-region inference for better availability?",
+                    default="true",
+                    required=False,
+                ),
+            ],
+        )
+
+    async def list_models(self) -> list[ModelInfo]:
+        """
+        List available Claude models on AWS Bedrock.
+        
+        Returns hardcoded list since Bedrock doesn't provide dynamic model discovery.
+        """
+        return [
+            ModelInfo(
+                id="anthropic.claude-sonnet-4-5-20250929-v1:0",
+                display_name="Claude Sonnet 4.5",
+                context_window=200000,
+                max_output_tokens=16000,
+                capabilities=["tools", "vision", "thinking", "streaming"],
+                defaults={"temperature": 0.7, "max_tokens": 4096},
+            ),
+            ModelInfo(
+                id="anthropic.claude-opus-4-1-20250805-v1:0",
+                display_name="Claude Opus 4.1",
+                context_window=200000,
+                max_output_tokens=32000,
+                capabilities=["tools", "vision", "thinking", "streaming"],
+                defaults={"temperature": 0.7, "max_tokens": 4096},
+            ),
+            ModelInfo(
+                id="anthropic.claude-haiku-4-5-20251001-v1:0",
+                display_name="Claude Haiku 4.5",
+                context_window=200000,
+                max_output_tokens=8192,
+                capabilities=["tools", "vision", "streaming", "fast"],
+                defaults={"temperature": 0.7, "max_tokens": 4096},
+            ),
+        ]
 
     def _get_inference_profile_prefix(self, region: str) -> str | None:
         """
@@ -392,6 +497,17 @@ class BedrockProvider:
                     },
                 )
 
+            # RAW level: Complete params dict as sent to Bedrock API (if debug AND raw_debug enabled)
+            if self.debug and self.raw_debug:
+                await self.coordinator.hooks.emit(
+                    "llm:request:raw",
+                    {
+                        "lvl": "DEBUG",
+                        "provider": "bedrock",
+                        "params": params,  # Complete untruncated params
+                    },
+                )
+
         start_time = time.time()
 
         # Call Bedrock API
@@ -401,6 +517,85 @@ class BedrockProvider:
 
             logger.info("[PROVIDER] Received response from Bedrock API")
             logger.debug(f"[PROVIDER] Response type: {response.model}")
+
+            # Handle auto-continuation for truncated responses
+            accumulated_content = list(response.content)
+            accumulated_input_tokens = response.usage.input_tokens
+            accumulated_output_tokens = response.usage.output_tokens
+            continuation_count = 0
+            MAX_CONTINUATION_ATTEMPTS = 5
+            
+            while response.stop_reason in ["max_tokens", "length"] and continuation_count < MAX_CONTINUATION_ATTEMPTS:
+                continuation_count += 1
+                logger.info(
+                    f"[PROVIDER] Response incomplete (stop_reason={response.stop_reason}), "
+                    f"continuing (attempt {continuation_count}/{MAX_CONTINUATION_ATTEMPTS})"
+                )
+                
+                # Emit continuation event
+                if self.coordinator and hasattr(self.coordinator, "hooks"):
+                    await self.coordinator.hooks.emit(
+                        "provider:continuation",
+                        {
+                            "provider": "bedrock",
+                            "continuation_number": continuation_count,
+                            "stop_reason": response.stop_reason,
+                        },
+                    )
+                
+                # Build continuation messages: original messages + assistant response so far
+                continuation_messages = all_messages + [
+                    {
+                        "role": "assistant",
+                        "content": [self._convert_content_block_to_api(block) for block in accumulated_content],
+                    }
+                ]
+                
+                # Make continuation call with same params but updated messages
+                continuation_params = dict(params)
+                continuation_params["messages"] = continuation_messages
+                
+                try:
+                    response = await asyncio.wait_for(
+                        self.client.messages.create(**continuation_params),
+                        timeout=self.timeout
+                    )
+                    
+                    # Accumulate content and usage
+                    accumulated_content.extend(response.content)
+                    accumulated_input_tokens += response.usage.input_tokens
+                    accumulated_output_tokens += response.usage.output_tokens
+                    
+                except Exception as e:
+                    logger.warning(
+                        f"[PROVIDER] Continuation {continuation_count} failed: {e}. "
+                        f"Returning partial response."
+                    )
+                    break
+            
+            # If we did continuations, build final response from accumulated data
+            if continuation_count > 0:
+                logger.info(
+                    f"[PROVIDER] Completed after {continuation_count} continuation(s), "
+                    f"total output tokens: {accumulated_output_tokens}"
+                )
+                # Create a simple object to hold accumulated data
+                class AccumulatedResponse:
+                    def __init__(self, content, stop_reason, input_tokens, output_tokens):
+                        self.content = content
+                        self.stop_reason = stop_reason
+                        class Usage:
+                            def __init__(self, input_tok, output_tok):
+                                self.input_tokens = input_tok
+                                self.output_tokens = output_tok
+                        self.usage = Usage(input_tokens, output_tokens)
+                
+                response = AccumulatedResponse(
+                    accumulated_content,
+                    response.stop_reason,
+                    accumulated_input_tokens,
+                    accumulated_output_tokens
+                )
 
             # Emit llm:response event
             if self.coordinator and hasattr(self.coordinator, "hooks"):
@@ -434,6 +629,17 @@ class BedrockProvider:
                             },
                             "status": "ok",
                             "duration_ms": elapsed_ms,
+                        },
+                    )
+
+                # RAW level: Complete response object from Bedrock API (if debug AND raw_debug enabled)
+                if self.debug and self.raw_debug:
+                    await self.coordinator.hooks.emit(
+                        "llm:response:raw",
+                        {
+                            "lvl": "DEBUG",
+                            "provider": "bedrock",
+                            "response": response.model_dump(),  # Complete untruncated response
                         },
                     )
 
@@ -592,6 +798,22 @@ class BedrockProvider:
             if "signature" in block:
                 cleaned["signature"] = block["signature"]
             return cleaned
+        if block_type == "reasoning":
+            return {
+                "type": "reasoning",
+                "content": block.get("content", []),
+                "summary": block.get("summary", []),
+            }
+        if block_type == "redacted_thinking":
+            return {
+                "type": "redacted_thinking",
+                "data": block.get("data", ""),
+            }
+        if block_type == "image":
+            return {
+                "type": "image",
+                "source": block.get("source", {}),
+            }
         if block_type == "tool_use":
             return {
                 "type": "tool_use",
@@ -613,6 +835,46 @@ class BedrockProvider:
         cleaned = dict(block)
         cleaned.pop("visibility", None)
         return cleaned
+
+    def _convert_content_block_to_api(self, block: Any) -> dict[str, Any]:
+        """Convert a content block object back to API dict format for continuation.
+        
+        Args:
+            block: Content block from API response
+            
+        Returns:
+            Dict suitable for sending back to API
+        """
+        if hasattr(block, 'type'):
+            if block.type == "text":
+                return {"type": "text", "text": block.text}
+            elif block.type == "thinking":
+                result = {"type": "thinking", "thinking": block.thinking}
+                if hasattr(block, 'signature') and block.signature:
+                    result["signature"] = block.signature
+                return result
+            elif block.type == "reasoning":
+                return {
+                    "type": "reasoning",
+                    "content": block.content,
+                    "summary": block.summary
+                }
+            elif block.type == "redacted_thinking":
+                return {"type": "redacted_thinking", "data": block.data}
+            elif block.type == "image":
+                return {"type": "image", "source": block.source}
+            elif block.type == "tool_use":
+                return {
+                    "type": "tool_use",
+                    "id": block.id,
+                    "name": block.name,
+                    "input": block.input
+                }
+        
+        # Fallback: return as dict
+        if hasattr(block, 'model_dump'):
+            return block.model_dump()
+        return dict(block)
 
     def _convert_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Convert messages to Anthropic format.
@@ -810,6 +1072,25 @@ class BedrockProvider:
                         thinking=block.thinking,
                         signature=getattr(block, "signature", None),
                         visibility="internal",
+                    )
+                )
+            elif block.type == "reasoning":
+                content_blocks.append(
+                    ReasoningBlock(
+                        content=block.content,
+                        summary=block.summary,
+                    )
+                )
+            elif block.type == "redacted_thinking":
+                content_blocks.append(
+                    RedactedThinkingBlock(
+                        data=block.data,
+                    )
+                )
+            elif block.type == "image":
+                content_blocks.append(
+                    ImageBlock(
+                        source=block.source,
                     )
                 )
             elif block.type == "tool_use":
