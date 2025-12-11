@@ -11,40 +11,19 @@ Access Anthropic's Claude models via AWS Bedrock as an AI provider for Amplifier
 
 ## Installation
 
-### For All Projects (Global)
-
 ```bash
 amplifier module add provider-bedrock \
-  --source git+https://github.com/brycecutt-msft/amplifier-module-provider-bedrock \
-  --global
+  --source git+https://github.com/brycecutt-msft/amplifier-module-provider-bedrock
 
-amplifier provider use bedrock --global
-```
-
-### For Current Project Only (Local)
-
-```bash
-amplifier module add provider-bedrock \
-  --source git+https://github.com/brycecutt-msft/amplifier-module-provider-bedrock \
-  --local
-
-amplifier provider use bedrock --local
-```
-
-### For Project Team (Project Scope)
-
-```bash
-amplifier module add provider-bedrock \
-  --source git+https://github.com/brycecutt-msft/amplifier-module-provider-bedrock \
-  --project
-
-amplifier provider use bedrock --project
+amplifier provider use bedrock
 ```
 
 The interactive setup will prompt for:
 - **AWS Profile** - Your AWS profile name (or press Enter to use default)
 - **AWS Region** - AWS region (default: us-east-1)
 - **Cross-Region Inference** - Enable for better availability (recommended: yes)
+
+> **Note:** By default, this installs for your current project. Use `--global`, `--project`, or `--local` flags to control scope. See [Amplifier Configuration](https://github.com/microsoft/amplifier#configuration) for details.
 
 ## Quick Test
 
@@ -59,16 +38,6 @@ amplifier run "What is 2+2?"
 - `anthropic.claude-haiku-4-5-20251001-v1:0` - Claude Haiku 4.5 (fastest, cheapest)
 
 > **Note:** Model availability varies by AWS region. See [AWS Bedrock Models](https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html) for the complete list.
-
-## Configuration Scopes
-
-Amplifier supports three configuration scopes:
-
-- **Local** (`--local`) - Just you, current project only (`.amplifier/settings.local.yaml`)
-- **Project** (`--project`) - Your team, shared in git (`.amplifier/settings.yaml`)
-- **Global** (`--global`) - All your projects (`~/.amplifier/settings.yaml`)
-
-See [Amplifier Configuration](https://github.com/microsoft/amplifier#configuration) for details.
 
 ## Features
 
