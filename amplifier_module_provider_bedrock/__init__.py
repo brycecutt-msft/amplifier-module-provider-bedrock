@@ -527,6 +527,30 @@ class BedrockProvider:
             
             while response.stop_reason in ["max_tokens", "length"] and continuation_count < MAX_CONTINUATION_ATTEMPTS:
                 continuation_count += 1
+                
+                # CHECK: Don't continue if response ENDS WITH tool_use blocks
+                # This indicates truncation mid-tool-call sequence (incomplete tool sequence)
+                # Continuing would create invalid message: assistant with tool_use NOT followed by user with tool_result
+                # Bedrock API requires: every tool_use must be immediately followed by tool_result in next message
+                # 
+                # Safe to continue: response ends with text (tool_use blocks earlier in response are fine)
+                # Unsafe to continue: response ends with tool_use (would violate API invariant)
+                last_block = accumulated_content[-1] if accumulated_content else None
+                ends_with_tool_use = (
+                    last_block and 
+                    hasattr(last_block, 'type') and 
+                    last_block.type == "tool_use"
+                )
+                
+                if ends_with_tool_use:
+                    logger.warning(
+                        f"[PROVIDER] Response truncated mid-tool-call (stop_reason={response.stop_reason}). "
+                        f"Last block is tool_use (id={last_block.id if hasattr(last_block, 'id') else 'unknown'}). "
+                        f"Cannot continue - would violate Bedrock API tool_use/tool_result invariant. "
+                        f"Returning partial response with {len(accumulated_content)} blocks."
+                    )
+                    break
+                
                 logger.info(
                     f"[PROVIDER] Response incomplete (stop_reason={response.stop_reason}), "
                     f"continuing (attempt {continuation_count}/{MAX_CONTINUATION_ATTEMPTS})"

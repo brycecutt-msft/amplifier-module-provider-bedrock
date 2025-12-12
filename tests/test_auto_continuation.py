@@ -5,8 +5,9 @@ Verifies that BedrockProvider handles truncated responses transparently
 by automatically continuing the conversation until complete.
 """
 
-import pytest
 from unittest.mock import AsyncMock, MagicMock
+
+import pytest
 from amplifier_module_provider_bedrock import BedrockProvider
 
 
@@ -290,3 +291,174 @@ class TestContinuationLoop:
         # Should have: user message + assistant message (from first response)
         assert len(messages) >= 2
         assert any(m["role"] == "assistant" for m in messages)
+
+
+class TestToolCallContinuationSafety:
+    """Test that continuation doesn't violate tool_use/tool_result invariants."""
+
+    @pytest.mark.asyncio
+    async def test_stops_continuation_when_response_ends_with_tool_use(self):
+        """Don't continue if response ENDS WITH tool_use block (incomplete tool sequence)."""
+        coordinator = MagicMock()
+        coordinator.hooks = AsyncMock()
+        coordinator.hooks.emit = AsyncMock()
+        
+        provider = BedrockProvider(
+            config={"aws_region": "us-east-1"},
+            coordinator=coordinator
+        )
+        
+        # Response truncated mid-tool-call sequence
+        # Contains tool_use but stop_reason is max_tokens
+        text_block = MagicMock()
+        text_block.type = "text"
+        text_block.text = "Let me call some tools"
+        
+        tool_block = MagicMock()
+        tool_block.type = "tool_use"
+        tool_block.id = "toolu_test_123"
+        tool_block.name = "search"
+        tool_block.input = {"query": "test"}
+        
+        incomplete_with_tools = MagicMock()
+        incomplete_with_tools.content = [text_block, tool_block]
+        incomplete_with_tools.stop_reason = "max_tokens"
+        incomplete_with_tools.usage = MagicMock(input_tokens=10, output_tokens=100)
+        
+        provider.client.messages.create = AsyncMock(return_value=incomplete_with_tools)
+        
+        from amplifier_core.message_models import ChatRequest, Message
+        request = ChatRequest(messages=[Message(role="user", content="test")])
+        response = await provider.complete(request)
+        
+        # Should NOT continue - would create invalid tool sequence
+        # Only 1 API call should be made
+        assert provider.client.messages.create.call_count == 1
+        
+        # Response should contain the partial tool_use blocks
+        assert len(response.tool_calls) == 1
+        assert response.tool_calls[0].id == "toolu_test_123"
+        
+        # Should have stop_reason indicating truncation
+        assert response.finish_reason == "max_tokens"
+
+    @pytest.mark.asyncio
+    async def test_continues_when_response_ends_with_text_after_tool_use(self):
+        """Continue normally if response has tool_use but ENDS WITH text (complete tool sequence)."""
+        coordinator = MagicMock()
+        coordinator.hooks = AsyncMock()
+        coordinator.hooks.emit = AsyncMock()
+        
+        provider = BedrockProvider(
+            config={"aws_region": "us-east-1"},
+            coordinator=coordinator
+        )
+        
+        # Response has tool_use but ends with text (safe to continue)
+        text_block1 = MagicMock()
+        text_block1.type = "text"
+        text_block1.text = "Let me search"
+        
+        tool_block = MagicMock()
+        tool_block.type = "tool_use"
+        tool_block.id = "toolu_test_123"
+        tool_block.name = "search"
+        tool_block.input = {"query": "test"}
+        
+        text_block2 = MagicMock()
+        text_block2.type = "text"
+        text_block2.text = "Let me also check..."
+        
+        incomplete_mixed = MagicMock()
+        incomplete_mixed.content = [text_block1, tool_block, text_block2]
+        incomplete_mixed.stop_reason = "max_tokens"
+        incomplete_mixed.usage = MagicMock(input_tokens=10, output_tokens=100)
+        
+        complete_text = MagicMock()
+        complete_text.content = [MagicMock(type="text", text="continuation")]
+        complete_text.stop_reason = "end_turn"
+        complete_text.usage = MagicMock(input_tokens=113, output_tokens=50)
+        
+        provider.client.messages.create = AsyncMock(
+            side_effect=[incomplete_mixed, complete_text]
+        )
+        
+        from amplifier_core.message_models import ChatRequest, Message
+        request = ChatRequest(messages=[Message(role="user", content="test")])
+        response = await provider.complete(request)
+        
+        # Should continue - last block is text (safe)
+        assert provider.client.messages.create.call_count == 2
+        
+        # Should accumulate all parts
+        assert len(response.content) == 4
+
+    @pytest.mark.asyncio
+    async def test_continues_normally_for_text_only_truncation(self):
+        """Continue normally if response only has text (no tool_use blocks)."""
+        coordinator = MagicMock()
+        coordinator.hooks = AsyncMock()
+        coordinator.hooks.emit = AsyncMock()
+        
+        provider = BedrockProvider(
+            config={"aws_region": "us-east-1"},
+            coordinator=coordinator
+        )
+        
+        # Text-only truncation (safe to continue)
+        incomplete_text = MagicMock()
+        incomplete_text.content = [MagicMock(type="text", text="Part 1")]
+        incomplete_text.stop_reason = "max_tokens"
+        incomplete_text.usage = MagicMock(input_tokens=10, output_tokens=100)
+        
+        complete_text = MagicMock()
+        complete_text.content = [MagicMock(type="text", text="Part 2")]
+        complete_text.stop_reason = "end_turn"
+        complete_text.usage = MagicMock(input_tokens=110, output_tokens=50)
+        
+        provider.client.messages.create = AsyncMock(
+            side_effect=[incomplete_text, complete_text]
+        )
+        
+        from amplifier_core.message_models import ChatRequest, Message
+        request = ChatRequest(messages=[Message(role="user", content="test")])
+        response = await provider.complete(request)
+        
+        # Should continue normally for text-only truncation
+        assert provider.client.messages.create.call_count == 2
+        
+        # Should accumulate both parts
+        assert len(response.content) == 2
+
+    @pytest.mark.asyncio
+    async def test_stops_when_only_tool_use_in_truncated_response(self):
+        """Stop continuation when response contains ONLY tool_use blocks (most severe case)."""
+        coordinator = MagicMock()
+        coordinator.hooks = AsyncMock()
+        coordinator.hooks.emit = AsyncMock()
+        
+        provider = BedrockProvider(
+            config={"aws_region": "us-east-1"},
+            coordinator=coordinator
+        )
+        
+        # Response with ONLY tool_use block (truncated before any text)
+        tool_block = MagicMock()
+        tool_block.type = "tool_use"
+        tool_block.id = "toolu_test_456"
+        tool_block.name = "calculator"
+        tool_block.input = {"expression": "2+2"}
+        
+        incomplete_with_tools = MagicMock()
+        incomplete_with_tools.content = [tool_block]
+        incomplete_with_tools.stop_reason = "max_tokens"
+        incomplete_with_tools.usage = MagicMock(input_tokens=10, output_tokens=100)
+        
+        provider.client.messages.create = AsyncMock(return_value=incomplete_with_tools)
+        
+        from amplifier_core.message_models import ChatRequest, Message
+        request = ChatRequest(messages=[Message(role="user", content="test")])
+        
+        # Should not raise exception and should stop after 1 call
+        await provider.complete(request)
+        assert provider.client.messages.create.call_count == 1
