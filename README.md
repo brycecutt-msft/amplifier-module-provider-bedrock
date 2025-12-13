@@ -12,8 +12,7 @@ Access Anthropic's Claude models via AWS Bedrock as an AI provider for Amplifier
 ## Installation
 
 ```bash
-amplifier module add provider-bedrock \
-  --source git+https://github.com/brycecutt-msft/amplifier-module-provider-bedrock
+amplifier module add provider-bedrock --source git+https://github.com/brycecutt-msft/amplifier-module-provider-bedrock
 
 amplifier provider use bedrock
 ```
