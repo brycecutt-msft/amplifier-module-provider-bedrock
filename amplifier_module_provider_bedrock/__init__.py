@@ -348,6 +348,9 @@ class BedrockProvider:
 
         Scans conversation for assistant tool calls and validates each has
         a corresponding tool result message. Returns missing pairs.
+        
+        Handles both ChatRequest format (ToolCallBlock in content) and
+        converted dict format (tool_calls field).
 
         Returns:
             List of (call_id, tool_name, tool_arguments) tuples for unpaired calls
@@ -356,15 +359,33 @@ class BedrockProvider:
         tool_results = set()  # {call_id}
 
         for msg in messages:
-            # Check assistant messages for ToolCallBlock in content
-            if msg.role == "assistant" and isinstance(msg.content, list):
-                for block in msg.content:
-                    if hasattr(block, "type") and block.type == "tool_call":
-                        tool_calls[block.id] = (block.name, block.input)
+            msg_role = msg.role if hasattr(msg, "role") else msg.get("role")
+            
+            # Check assistant messages for tool calls
+            if msg_role == "assistant":
+                # Format 1: ToolCallBlock objects in content list (ChatRequest format)
+                msg_content = msg.content if hasattr(msg, "content") else msg.get("content")
+                if isinstance(msg_content, list):
+                    for block in msg_content:
+                        if hasattr(block, "type") and block.type == "tool_call":
+                            tool_calls[block.id] = (block.name, block.input)
+                
+                # Format 2: tool_calls field (dict format from model_dump)
+                if hasattr(msg, "tool_calls") and msg.tool_calls:
+                    for tc in msg.tool_calls:
+                        tc_id = tc.id if hasattr(tc, "id") else tc.get("id")
+                        tc_name = tc.name if hasattr(tc, "name") else tc.get("tool")
+                        tc_args = tc.arguments if hasattr(tc, "arguments") else tc.get("arguments", {})
+                        tool_calls[tc_id] = (tc_name, tc_args)
+                elif isinstance(msg, dict) and "tool_calls" in msg and msg["tool_calls"]:
+                    for tc in msg["tool_calls"]:
+                        tool_calls[tc.get("id")] = (tc.get("tool"), tc.get("arguments", {}))
 
             # Check tool messages for tool_call_id
-            elif msg.role == "tool" and hasattr(msg, "tool_call_id") and msg.tool_call_id:
-                tool_results.add(msg.tool_call_id)
+            elif msg_role == "tool":
+                tool_call_id = msg.tool_call_id if hasattr(msg, "tool_call_id") else msg.get("tool_call_id")
+                if tool_call_id:
+                    tool_results.add(tool_call_id)
 
         return [(call_id, name, args) for call_id, (name, args) in tool_calls.items() if call_id not in tool_results]
 
@@ -845,6 +866,14 @@ class BedrockProvider:
                 "name": block.get("name", ""),
                 "input": block.get("input", {}),
             }
+        if block_type == "tool_call":
+            # Convert tool_call (from ToolCallBlock) to tool_use (Anthropic API format)
+            return {
+                "type": "tool_use",
+                "id": block.get("id", ""),
+                "name": block.get("name", ""),
+                "input": block.get("input", {}),
+            }
         if block_type == "tool_result":
             content = block.get("content", "")
             # Ensure content is a string
@@ -1014,8 +1043,20 @@ class BedrockProvider:
                 else:
                     # Regular assistant message - may have structured content blocks
                     if isinstance(content, list):
-                        # Content is a list of blocks - clean each block
-                        cleaned_blocks = [self._clean_content_block(block) for block in content]
+                        # Content is a list of blocks - clean each block and convert tool_call to tool_use
+                        cleaned_blocks = []
+                        for block in content:
+                            # Handle tool_call blocks (from ToolCallBlock objects)
+                            if isinstance(block, dict) and block.get("type") == "tool_call":
+                                # Convert tool_call to tool_use format for Anthropic API
+                                cleaned_blocks.append({
+                                    "type": "tool_use",
+                                    "id": block.get("id", ""),
+                                    "name": block.get("name", ""),
+                                    "input": block.get("input", {}),
+                                })
+                            else:
+                                cleaned_blocks.append(self._clean_content_block(block))
                         anthropic_messages.append({"role": "assistant", "content": cleaned_blocks})
                     else:
                         # Content is a simple string
