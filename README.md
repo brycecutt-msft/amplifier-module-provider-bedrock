@@ -32,11 +32,52 @@ amplifier run "What is 2+2?"
 
 ## Supported Models
 
-- `anthropic.claude-sonnet-4-5-20250929-v1:0` - Claude Sonnet 4.5 (recommended, default)
-- `anthropic.claude-opus-4-1-20250805-v1:0` - Claude Opus 4.1 (most capable)
-- `anthropic.claude-haiku-4-5-20251001-v1:0` - Claude Haiku 4.5 (fastest, cheapest)
+`await provider.list_models()` discovers actual AWS targets for the resolved
+region and selected invocation route. It does not use the direct Anthropic
+catalog or invent regional prefixes:
 
-> **Note:** Model availability varies by AWS region. See [AWS Bedrock Models](https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html) for the complete list.
+- Cross-region enabled (default): all pages of `ListInferenceProfiles`, keeping
+  profiles whose targets are Claude models. System profile IDs are byte-exact;
+  application profile ARNs retain each distinct configured route.
+- Cross-region disabled: `ListFoundationModels` with the supported native
+  Anthropic/TEXT/ON_DEMAND filters, keeping text-input Claude models.
+
+Default recommendation filters are `active_only: true` and
+`latest_per_family: true`: latest numeric Opus/Sonnet/Haiku/Fable version per
+system route, alias before a matching snapshot, newest snapshot otherwise.
+Distinct application profiles and unrecognized Claude naming schemes are
+retained conservatively rather than guessed away. Different tiers are not ranked
+by intelligence or price.
+
+`get_model_list_info()` reports `source: "provider-api"`, region, invocation route,
+and the full v1 filter schema. Listing is **not proof of InvokeModel entitlement**.
+AWS does not publish token limits or all capabilities in these catalog responses;
+returned limits are `0` (unknown), with no invented capability tags.
+
+`config.model_filters` is snapshotted at construction. `filters=None` uses it;
+an explicit mapping replaces it. `filters={}` disables all recommendation filters
+(not Claude/route compatibility), `filters={"include":[]}` returns none, and
+`filters={"include":["*SONNET*"],"exclude":["global.*"]}` uses case-insensitive,
+OS-independent globs. Exclusion wins and original returned IDs are unchanged.
+Common `hide_dated` suppresses ISO YYYY-MM-DD alias snapshots; Bedrock's compact
+dates and version suffixes are handled by `latest_per_family`. Neither policy
+silently applies to explicit custom/unfiltered requests.
+
+Discovery failures raise sanitized typed errors, never a cached/static list.
+Custom runtime endpoints are not treated as AWS inventory: listing fails
+explicitly rather than enumerating an unrelated standard endpoint. Control-plane
+requests ignore ambient endpoint URL overrides and use the selected AWS region.
+Control-plane request connect/read waits are bounded at 5/10 seconds, without
+retries. These bounds do not cover credential resolution (for example,
+`credential_process` or an MFA prompt) and are not a total elapsed deadline.
+Cancellation returns to the caller and stops subsequent pages, but cannot
+interrupt synchronous boto3 work. Its worker thread may linger until credential
+lookup or an in-flight request returns. Any created client closes when that work
+settles, not necessarily when cancellation returns. No inference call is made.
+Local missing/invalid profiles and expired or missing SSO tokens produce
+non-retryable configuration/authentication errors, not a retryable outage.
+Existing exact selections and the configured inference default are not changed
+or restricted by recommendations.
 
 ## Features
 
@@ -84,11 +125,17 @@ The provider supports all standard AWS authentication:
 
 See [AWS CLI Configuration](https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-files.html).
 
+Explicit `aws_profile` configuration wins. Otherwise `AWS_DEFAULT_PROFILE`
+takes precedence over `AWS_PROFILE`, matching botocore. The resolved selection
+is shared by inference and discovery.
+
 ### Required Permissions
 
 Your AWS credentials need:
 - `bedrock:InvokeModel`
 - `bedrock:InvokeModelWithResponseStream`
+- `bedrock:ListInferenceProfiles` for cross-region catalog discovery, or
+  `bedrock:ListFoundationModels` for direct on-demand catalog discovery
 
 See [AWS Bedrock IAM](https://docs.aws.amazon.com/bedrock/latest/userguide/security-iam.html).
 
@@ -104,7 +151,9 @@ The provider automatically prefixes model IDs based on your region:
 | `eu-*` | `eu.` | `eu.anthropic.claude-sonnet-4-5-20250929-v1:0` |
 | `ap-*` | `apac.` | `apac.anthropic.claude-sonnet-4-5-20250929-v1:0` |
 
-You only specify the base model ID—the prefix is automatic.
+Legacy explicit base-model selections still receive this automatic prefix.
+Catalog selections instead use actual returned profile IDs/ARNs unchanged; an
+existing inference profile prefix or ARN is never prefixed again.
 
 ## Differences from Anthropic Provider
 
@@ -177,7 +226,7 @@ amplifier run "test query"
 
 ```bash
 # Install dev dependencies
-uv sync --extra dev
+uv sync --locked --dev
 
 # Run tests
 uv run pytest
@@ -193,3 +242,37 @@ MIT
 ## Contributing
 
 See the main Amplifier repository for contribution guidelines.
+
+### Bounded output and completion waits
+
+Healthy requests have no default elapsed/read deadline. Explicit `timeout`
+configuration remains supported, with a five-second connection/pool bound.
+Cancellation still propagates. Slow model work must not be canceled by a default
+deadline. Transport phase bounds do not bound credential lookup or a total
+elapsed request. A stalled read may wait until the caller cancels or an explicit
+timeout expires; this change does not introduce a default generation deadline.
+
+An explicit nonempty `model=` keyword overrides `ChatRequest.model`; both take
+precedence over the configured default. `request_options` may supply the same
+override, with explicit keywords taking precedence over the mapping. Listing
+filters do not restrict exact inference selection.
+
+The adapter preserves its selected `temperature` in the AWS Claude Messages
+JSON body via the SDK's documented `extra_body` extension. This works with older
+SDKs and newer SDKs that no longer accept a named `temperature` keyword; it does
+not remove, clamp, or retry without that value. The target AWS model still
+determines which inference parameters it supports. Service rejection remains
+an error, not permission to silently drop an explicitly selected parameter.
+
+`auto_continue` defaults to `true`. Set it to `false` in configuration or pass
+`request_options={"auto_continue": False}` to `complete()` to return a truncated
+response without extra generation calls. Partial content, finish reason and usage
+remain available; callers must not commit a truncated result as a complete
+summary. The optional capability is `completion:auto_continue:v1`. This option is
+consumed locally, never sent to the service, and does not impose a time limit.
+
+`raw: true` enables opt-in request capture on `llm:request.raw`, independently of
+debug logging. Redaction is best-effort and key-based: known sensitive keys are
+redacted, but secrets embedded in message text or other strings are not. Treat
+captured payloads as sensitive. It defaults to false; previous debug/raw_debug
+behavior remains supported and may emit unredacted payloads.

@@ -10,9 +10,13 @@ import asyncio
 import logging
 import os
 import time
+from collections.abc import Mapping
+from threading import Event
 from typing import Any
+from ._catalog import CatalogFilters, catalog_schema, fetch_catalog, model_info
 
 from amplifier_core import ConfigField, ModelInfo, ModuleCoordinator, ProviderInfo
+from amplifier_core.utils import redact_secrets
 from amplifier_core.message_models import (
     ChatRequest,
     ChatResponse,
@@ -84,6 +88,16 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
     return cleanup
 
 
+def _cache_counter(usage, field):
+    """Keep absent cache measurements unknown; do not coerce unknown to zero."""
+    value = getattr(usage, field, None)
+    return value if type(value) is int and value >= 0 else None
+
+
+def _sum_counter(left, right):
+    return left + right if left is not None and right is not None else None
+
+
 class BedrockProvider:
     """AWS Bedrock API integration.
 
@@ -109,10 +123,15 @@ class BedrockProvider:
         """
         self.config = config or {}
         self.coordinator = coordinator
+        self._model_filters = CatalogFilters.parse(self.config.get("model_filters", {
+            "active_only": True, "latest_per_family": True,
+        }))
 
         # AWS configuration
         aws_region = self.config.get("aws_region") or os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
-        aws_profile = self.config.get("aws_profile")
+        # Match botocore's environment precedence while binding the same profile
+        # to inference and discovery. Explicit provider configuration wins.
+        aws_profile = self.config.get("aws_profile") or os.environ.get("AWS_DEFAULT_PROFILE") or os.environ.get("AWS_PROFILE")
         aws_access_key = self.config.get("aws_access_key") or os.environ.get("AWS_ACCESS_KEY_ID")
         aws_secret_key = self.config.get("aws_secret_key") or os.environ.get("AWS_SECRET_ACCESS_KEY")
         aws_session_token = self.config.get("aws_session_token") or os.environ.get("AWS_SESSION_TOKEN")
@@ -121,6 +140,8 @@ class BedrockProvider:
         # AWS Bedrock Inference Profile mapping based on official documentation
         # https://docs.aws.amazon.com/bedrock/latest/userguide/inference-profiles-support.html
         self.use_cross_region_inference = self.config.get("use_cross_region_inference", True)  # Enabled by default
+        if type(self.use_cross_region_inference) is not bool:
+            raise ValueError("use_cross_region_inference must be a boolean")
         self.aws_region = aws_region
         self.inference_profile_mapping = [
             # Ordered by pattern length (descending) to ensure more specific patterns match first
@@ -156,7 +177,23 @@ class BedrockProvider:
             logger.info("Using explicit AWS credentials")
         
         # Initialize AsyncAnthropicBedrock client
+        # Use the SDK-exported type across its HTTPX / HTTPX2 transition.
+        from anthropic import Timeout
+
+        client_kwargs["timeout"] = Timeout(
+            self.config.get("timeout"), connect=5.0, pool=5.0
+        )
         self.client = AsyncAnthropicBedrock(**client_kwargs)
+        # Bind listing to the same resolved AWS selectors as inference, rather
+        # than re-reading mutable provider config or assuming Anthropic access.
+        self.aws_region = self.client.aws_region
+        self._catalog_session_kwargs = {
+            "region_name": self.client.aws_region,
+            "profile_name": self.client.aws_profile,
+            "aws_access_key_id": self.client.aws_access_key,
+            "aws_secret_access_key": self.client.aws_secret_key,
+            "aws_session_token": self.client.aws_session_token,
+        }
 
         # Model configuration
         self.default_model = self.config.get("default_model", "anthropic.claude-sonnet-4-5-20250929-v1:0")
@@ -165,7 +202,15 @@ class BedrockProvider:
         self.priority = self.config.get("priority", 100)
         self.debug = self.config.get("debug", False)
         self.raw_debug = self.config.get("raw_debug", False)
-        self.timeout = self.config.get("timeout", 300.0)
+        self.raw = self.config.get("raw", False)
+        if type(self.raw) is not bool:
+            raise ValueError("raw must be a boolean")
+        # Healthy model work must not expire merely because it is slow.
+        # Keep connection acquisition bounded; an explicit timeout still opts in.
+        self.timeout = self.config.get("timeout")
+        self.auto_continue = self.config.get("auto_continue", True)
+        if type(self.auto_continue) is not bool:
+            raise ValueError("auto_continue must be a boolean")
 
         # Log configuration
         logger.info(f"BedrockProvider initialized - region: {self.client.aws_region}, default_model: {self.default_model}")
@@ -179,15 +224,34 @@ class BedrockProvider:
         return ProviderInfo(
             id="bedrock",
             display_name="AWS Bedrock",
-            credential_env_vars=["AWS_PROFILE", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_REGION"],
-            capabilities=["streaming", "tools", "thinking", "vision"],
+            credential_env_vars=[
+                "AWS_PROFILE",
+                "AWS_ACCESS_KEY_ID",
+                "AWS_SECRET_ACCESS_KEY",
+                "AWS_REGION",
+            ],
+            capabilities=[
+                "streaming",
+                "tools",
+                "thinking",
+                "vision",
+                "completion:auto_continue:v1",
+            ],
             defaults={
                 "model": "anthropic.claude-sonnet-4-5-20250929-v1:0",
                 "max_tokens": 4096,
                 "temperature": 0.7,
-                "timeout": 300.0,
+                "timeout": None,
             },
             config_fields=[
+                ConfigField(
+                    id="auto_continue",
+                    display_name="Continue truncated responses",
+                    field_type="boolean",
+                    prompt="Automatically continue responses that reach the output limit",
+                    default="true",
+                    required=False,
+                ),
                 ConfigField(
                     id="aws_profile",
                     display_name="AWS Profile",
@@ -216,46 +280,58 @@ class BedrockProvider:
             ],
         )
 
-    async def list_models(self) -> list[ModelInfo]:
+    def get_model_list_info(self) -> dict[str, Any]:
+        """Local selector metadata, without any AWS requests."""
+        return {
+            "version": 1, "source": "provider-api",
+            "filters_keyword": "filters", "filters_schema": catalog_schema(),
+            "default_filters": self._model_filters.as_dict(),
+            "unfiltered": {}, "override": "replace",
+            "region": self.aws_region,
+            "invocation_route": "inference-profiles" if self.use_cross_region_inference else "on-demand",
+            "entitlement_verified": False,
+        }
+
+    async def list_models(
+        self, *, filters: Mapping[str, object] | None = None
+    ) -> list[ModelInfo]:
+        """Discover Claude targets on this AWS region and invocation route.
+
+        {} disables recommendation filters, not adapter/route compatibility.
+        No cached/static fallback. Zero limits mean unknown, not a guessed limit.
+        AWS listing is not proof that InvokeModel is authorized for each target.
         """
-        List available Claude models on AWS Bedrock.
-        
-        Returns hardcoded list since Bedrock doesn't provide dynamic model discovery.
-        """
-        return [
-            ModelInfo(
-                id="anthropic.claude-sonnet-4-5-20250929-v1:0",
-                display_name="Claude Sonnet 4.5",
-                context_window=200000,
-                max_output_tokens=16000,
-                capabilities=["tools", "vision", "thinking", "streaming"],
-                defaults={"temperature": 0.7, "max_tokens": 4096},
-            ),
-            ModelInfo(
-                id="anthropic.claude-opus-4-1-20250805-v1:0",
-                display_name="Claude Opus 4.1",
-                context_window=200000,
-                max_output_tokens=32000,
-                capabilities=["tools", "vision", "thinking", "streaming"],
-                defaults={"temperature": 0.7, "max_tokens": 4096},
-            ),
-            ModelInfo(
-                id="anthropic.claude-haiku-4-5-20251001-v1:0",
-                display_name="Claude Haiku 4.5",
-                context_window=200000,
-                max_output_tokens=8192,
-                capabilities=["tools", "vision", "streaming", "fast"],
-                defaults={"temperature": 0.7, "max_tokens": 4096},
-            ),
-        ]
+        policy = self._model_filters if filters is None else CatalogFilters.parse(filters)
+        expected_runtime = f"https://bedrock-runtime.{self.aws_region}.amazonaws.com"
+        if str(self.client.base_url).rstrip("/") != expected_runtime:
+            from amplifier_core.llm_errors import LLMError
+            raise LLMError(
+                "Model listing is unavailable for a custom Bedrock runtime endpoint",
+                provider=self.name,
+            )
+        cancelled = Event()
+        task = asyncio.create_task(asyncio.to_thread(
+            fetch_catalog, dict(self._catalog_session_kwargs),
+            self.use_cross_region_inference, cancelled,
+        ))
+        try:
+            entries = await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled.set()
+            # Credential lookup and synchronous requests cannot be interrupted.
+            # The worker may linger; it closes any existing client when it settles.
+            # Retrieve a late failure without logging secrets.
+            task.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+            raise
+        return [model_info(entry) for entry in policy.select(entries)]
 
     def _get_inference_profile_prefix(self, region: str) -> str | None:
         """
         Get the inference profile prefix for a given AWS region.
-        
+
         Args:
             region: AWS region (e.g., "us-east-1")
-            
+
         Returns:
             Inference profile prefix (e.g., "us.") or None if no mapping found
         """
@@ -273,13 +349,20 @@ class BedrockProvider:
     def _apply_inference_profile(self, model_id: str) -> str:
         """
         Apply cross-region inference profile prefix to model ID if enabled.
-        
+
         Args:
             model_id: Base model ID (e.g., "anthropic.claude-sonnet-4-5-20250929-v1:0")
-            
+
         Returns:
             Model ID with inference profile prefix if applicable (e.g., "us.anthropic.claude-sonnet-4-5-20250929-v1:0")
         """
+        # Already-qualified AWS ARNs (including application profiles) are exact
+        # invocation targets. Do not prefix them with a guessed regional route.
+        if model_id.startswith("arn:"):
+            return model_id
+        if ".anthropic.claude-" in model_id:
+            return model_id  # Exact system profile ID, including future routes.
+
         # Skip if cross-region inference is disabled
         if not self.use_cross_region_inference:
             return model_id
@@ -313,6 +396,19 @@ class BedrockProvider:
         Returns:
             ChatResponse with content blocks, tool calls, usage
         """
+        request_options = kwargs.pop("request_options", None)
+        if request_options is not None:
+            from collections.abc import Mapping
+
+            if not isinstance(request_options, Mapping):
+                raise ValueError("request_options must be a mapping or None")
+            kwargs = {**request_options, **kwargs}
+        auto_continue = kwargs.get("auto_continue", self.auto_continue)
+        if type(auto_continue) is not bool:
+            raise ValueError("auto_continue must be a boolean")
+        # A bounded output operation opts out of hidden paid continuations;
+        # this is not a deadline and does not cancel healthy model work.
+
         # VALIDATE AND REPAIR: Check for missing tool results (backup safety net)
         missing = self._find_missing_tool_results(request.messages)
 
@@ -442,14 +538,19 @@ class BedrockProvider:
         logger.info(f"[PROVIDER] Final message count for API: {len(all_messages)}")
 
         # Prepare request parameters
-        base_model = kwargs.get("model", self.default_model)
+        base_model = kwargs.get("model") or request.model or self.default_model
         model_with_profile = self._apply_inference_profile(base_model)
         
         params = {
             "model": model_with_profile,
             "messages": all_messages,
-            "max_tokens": request.max_output_tokens or kwargs.get("max_tokens", self.max_tokens),
-            "temperature": request.temperature or kwargs.get("temperature", self.temperature),
+            "max_tokens": request.max_output_tokens
+            or kwargs.get("max_tokens", self.max_tokens),
+            "temperature": (
+                request.temperature
+                if request.temperature is not None
+                else kwargs.get("temperature", self.temperature)
+            ),
         }
 
         if system:
@@ -465,18 +566,22 @@ class BedrockProvider:
 
         # Emit llm:request event
         if self.coordinator and hasattr(self.coordinator, "hooks"):
-            # INFO level: Summary only
-            await self.coordinator.hooks.emit(
-                "llm:request",
-                {
-                    "data": {
-                        "provider": "bedrock",
-                        "model": params["model"],
-                        "message_count": len(params["messages"]),
-                        "has_system": bool(system),
-                    }
+            request_event = {
+                "provider": "bedrock",
+                "model": params["model"],
+                "message_count": len(all_messages),
+                "data": {
+                    "provider": "bedrock",
+                    "model": params["model"],
+                    "messages_count": len(all_messages),
+                    # Retain legacy nested keys for existing event hooks.
+                    "message_count": len(all_messages),
+                    "has_system": bool(system),
                 },
-            )
+            }
+            if self.raw:
+                request_event["raw"] = redact_secrets(params)
+            await self.coordinator.hooks.emit("llm:request", request_event)
 
             # DEBUG level: Full request payload (if debug enabled)
             if self.debug:
@@ -510,9 +615,20 @@ class BedrockProvider:
 
         start_time = time.time()
 
+        # Temperature remains an AWS Claude Messages wire parameter, but newer
+        # Anthropic SDKs removed its named create() keyword. The documented
+        # extra_body extension preserves it across old/new SDKs without retrying
+        # a call or silently dropping the user's value. Keep event payloads in
+        # their existing wire-shaped form above.
+        sdk_params = dict(params)
+        sdk_params["extra_body"] = {"temperature": sdk_params.pop("temperature")}
+
         # Call Bedrock API
         try:
-            response = await asyncio.wait_for(self.client.messages.create(**params), timeout=self.timeout)
+            response = await asyncio.wait_for(
+                self.client.messages.create(**sdk_params, timeout=self.client.timeout),
+                timeout=self.timeout,
+            )
             elapsed_ms = int((time.time() - start_time) * 1000)
 
             logger.info("[PROVIDER] Received response from Bedrock API")
@@ -520,12 +636,20 @@ class BedrockProvider:
 
             # Handle auto-continuation for truncated responses
             accumulated_content = list(response.content)
+            total_cache_read = _cache_counter(response.usage, "cache_read_input_tokens")
+            total_cache_write = _cache_counter(
+                response.usage, "cache_creation_input_tokens"
+            )
             accumulated_input_tokens = response.usage.input_tokens
             accumulated_output_tokens = response.usage.output_tokens
             continuation_count = 0
             MAX_CONTINUATION_ATTEMPTS = 5
-            
-            while response.stop_reason in ["max_tokens", "length"] and continuation_count < MAX_CONTINUATION_ATTEMPTS:
+
+            while (
+                response.stop_reason in ["max_tokens", "length"]
+                and kwargs.get("auto_continue", self.auto_continue)
+                and continuation_count < MAX_CONTINUATION_ATTEMPTS
+            ):
                 continuation_count += 1
                 
                 # CHECK: Don't continue if response ENDS WITH tool_use blocks
@@ -576,17 +700,27 @@ class BedrockProvider:
                 ]
                 
                 # Make continuation call with same params but updated messages
-                continuation_params = dict(params)
+                continuation_params = dict(sdk_params)
                 continuation_params["messages"] = continuation_messages
                 
                 try:
                     response = await asyncio.wait_for(
-                        self.client.messages.create(**continuation_params),
-                        timeout=self.timeout
+                        self.client.messages.create(
+                            **continuation_params, timeout=self.client.timeout
+                        ),
+                        timeout=self.timeout,
                     )
                     
                     # Accumulate content and usage
                     accumulated_content.extend(response.content)
+                    total_cache_read = _sum_counter(
+                        total_cache_read,
+                        _cache_counter(response.usage, "cache_read_input_tokens"),
+                    )
+                    total_cache_write = _sum_counter(
+                        total_cache_write,
+                        _cache_counter(response.usage, "cache_creation_input_tokens"),
+                    )
                     accumulated_input_tokens += response.usage.input_tokens
                     accumulated_output_tokens += response.usage.output_tokens
                     
@@ -621,12 +755,21 @@ class BedrockProvider:
                     accumulated_output_tokens
                 )
 
+            if continuation_count > 0:
+                response.usage.cache_read_input_tokens = total_cache_read
+                response.usage.cache_creation_input_tokens = total_cache_write
+
+            chat_response = self._convert_to_chat_response(response)
+
             # Emit llm:response event
             if self.coordinator and hasattr(self.coordinator, "hooks"):
                 # INFO level: Summary only
                 await self.coordinator.hooks.emit(
                     "llm:response",
                     {
+                        "provider": "bedrock",
+                        "model": params["model"],
+                        "usage": chat_response.usage.model_dump(),
                         "data": {
                             "provider": "bedrock",
                             "model": params["model"],
@@ -663,12 +806,12 @@ class BedrockProvider:
                         {
                             "lvl": "DEBUG",
                             "provider": "bedrock",
-                            "response": response.model_dump(),  # Complete untruncated response
+                            "response": chat_response.model_dump(),  # Includes measured continuation usage
                         },
                     )
 
             # Convert to ChatResponse
-            return self._convert_to_chat_response(response)
+            return chat_response
 
         except Exception as e:
             elapsed_ms = int((time.time() - start_time) * 1000)
@@ -862,10 +1005,10 @@ class BedrockProvider:
 
     def _convert_content_block_to_api(self, block: Any) -> dict[str, Any]:
         """Convert a content block object back to API dict format for continuation.
-        
+
         Args:
             block: Content block from API response
-            
+
         Returns:
             Dict suitable for sending back to API
         """
@@ -1121,15 +1264,28 @@ class BedrockProvider:
                 content_blocks.append(ToolCallBlock(id=block.id, name=block.name, input=block.input))
                 tool_calls.append(ToolCall(id=block.id, name=block.name, arguments=block.input))
 
+        # Bedrock reports fresh input separately from cache reads. Kernel input
+        # includes reads; cache writes remain a separate billed counter.
+        input_tokens = response.usage.input_tokens + (
+            _cache_counter(response.usage, "cache_read_input_tokens") or 0
+        )
         usage = Usage(
-            input_tokens=response.usage.input_tokens,
+            input_tokens=input_tokens,
             output_tokens=response.usage.output_tokens,
-            total_tokens=response.usage.input_tokens + response.usage.output_tokens,
+            total_tokens=input_tokens + response.usage.output_tokens,
+            cache_read_tokens=_cache_counter(response.usage, "cache_read_input_tokens"),
+            cache_write_tokens=_cache_counter(
+                response.usage, "cache_creation_input_tokens"
+            ),
         )
 
         return ChatResponse(
             content=content_blocks,
             tool_calls=tool_calls if tool_calls else None,
             usage=usage,
-            finish_reason=response.stop_reason,
+            finish_reason=(
+                "length"
+                if response.stop_reason in ("max_tokens", "length")
+                else response.stop_reason
+            ),
         )

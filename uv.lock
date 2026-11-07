@@ -4,9 +4,10 @@ requires-python = ">=3.11"
 
 [[package]]
 name = "amplifier-core"
-version = "1.0.0"
-source = { git = "https://github.com/microsoft/amplifier-core?branch=main#e4bc43171925f2c01b4f7de18ae93fda9a6b32aa" }
+version = "2.0.2"
+source = { git = "https://github.com/microsoft/amplifier-core?branch=main#9614052f7c9e493977dcba3f5c98ebd4d8591ec5" }
 dependencies = [
+    { name = "click" },
     { name = "pydantic" },
     { name = "pyyaml" },
     { name = "tomli" },
@@ -20,6 +21,7 @@ source = { editable = "." }
 dependencies = [
     { name = "amplifier-core" },
     { name = "anthropic", extra = ["bedrock"] },
+    { name = "boto3" },
 ]
 
 [package.dev-dependencies]
@@ -31,7 +33,8 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "amplifier-core", git = "https://github.com/microsoft/amplifier-core?branch=main" },
-    { name = "anthropic", extras = ["bedrock"], specifier = ">=0.25.0" },
+    { name = "anthropic", extras = ["bedrock"], specifier = ">=0.35.0" },
+    { name = "boto3", specifier = ">=1.40.0" },
 ]
 
 [package.metadata.requires-dev]
@@ -123,6 +126,15 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/4c/5b/b6ce21586237c77ce67d01dc5507039d444b630dd76611bbca2d8e5dcd91/certifi-2025.10.5.tar.gz", hash = "sha256:47c09d31ccf2acf0be3f701ea53595ee7e0b8fa08801c6624be771df09ae7b43", size = 164519, upload-time = "2025-10-05T04:12:15.808Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/e4/37/af0d2ef3967ac0d6113837b44a4f0bfe1328c2b9763bd5b1744520e5cfed/certifi-2025.10.5-py3-none-any.whl", hash = "sha256:0f212c2744a9bb6de0c56639a6f68afe01ecd92d91f14ae897c4fe7bbeeef0de", size = 163286, upload-time = "2025-10-05T04:12:14.03Z" },
+]
+
+[[package]]
+name = "click"
+version = "8.5.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/45/37/edbf1b0707709013c0cf2e8317e03d97ed29bf4cac709fe328904ae92a38/click-8.5.1.tar.gz", hash = "sha256:9bbfada76703fd1d784b83eea012e3e8c6a001a876543ef104fa56aaaeb072b4", size = 399151, upload-time = "2026-11-06T17:37:01.021Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/31/7d/164b7ffc8624fe9efb4221bf9af485d5c1e41b9ae118045d2b6dc5457d8b/click-8.5.1-py3-none-any.whl", hash = "sha256:8bb5376d2006950386f8c6427613334a2acadc5f559cb80e638d00b4df957e37", size = 126163, upload-time = "2026-11-06T17:36:59.287Z" },
 ]
 
 [[package]]

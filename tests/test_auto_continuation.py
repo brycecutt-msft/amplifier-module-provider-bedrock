@@ -340,7 +340,7 @@ class TestToolCallContinuationSafety:
         assert response.tool_calls[0].id == "toolu_test_123"
         
         # Should have stop_reason indicating truncation
-        assert response.finish_reason == "max_tokens"
+        assert response.finish_reason == "length"
 
     @pytest.mark.asyncio
     async def test_continues_when_response_ends_with_text_after_tool_use(self):

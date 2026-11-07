@@ -45,9 +45,15 @@ class TestListModelsMethod:
         assert callable(provider.list_models)
 
     @pytest.mark.asyncio
-    async def test_list_models_returns_list(self):
+    async def test_list_models_returns_list(self, monkeypatch):
         """list_models() returns list of ModelInfo objects."""
         from amplifier_core import ModelInfo
+        from amplifier_module_provider_bedrock._catalog import CatalogEntry
+        monkeypatch.setattr("amplifier_module_provider_bedrock.fetch_catalog",
+                            lambda *args: [CatalogEntry(
+                                "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+                                "Fixture Sonnet", True,
+                                "anthropic.claude-sonnet-4-5-20250929-v1:0", "us.")])
         
         provider = BedrockProvider(config={"aws_region": "us-east-1"})
         models = await provider.list_models()
